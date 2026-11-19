@@ -171,6 +171,10 @@ class Contact(StatesGroup):
     message = State()
 
 
+class AdminAction(StatesGroup):
+    clarification = State()
+
+
 router = Router()
 
 
@@ -193,6 +197,62 @@ def confirm_menu():
         [InlineKeyboardButton(text="Подтвердить бриф", callback_data="brief:confirm")],
         [InlineKeyboardButton(text="Заполнить заново", callback_data="brief:restart")],
     ])
+
+
+def order_action_menu(order_id: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Принять заявку", callback_data=f"order:accept:{order_id}")],
+        [InlineKeyboardButton(text="Запросить уточнение", callback_data=f"order:clarify:{order_id}")],
+        [InlineKeyboardButton(text="Отклонить заявку", callback_data=f"order:reject:{order_id}")],
+    ])
+
+
+async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None:
+            return False
+        client = await db.get(Client, order.client_id)
+        attachments = list((await db.scalars(
+            select(OrderFile).where(OrderFile.order_id == order_id)
+        )).all())
+        brief = dict(order.brief or {})
+        client_id = client.telegram_id if client else 0
+        username = client.username if client else None
+        status = order.status
+        source = order.source
+        notes = order.assistant_notes
+        created_at = order.created_at
+
+    lines = [
+        f"Заявка: {order_id}",
+        f"Статус: {status}",
+        f"Клиент: @{username}" if username else f"Клиент ID: {client_id}",
+        f"Telegram ID: {client_id}",
+        f"Источник: {source}",
+    ]
+    for key, label in (
+        ("platform", "Площадка"), ("product", "Товар"), ("advantages", "Преимущества"),
+        ("required_text", "Тексты"), ("style", "Стиль"), ("colors", "Цвета"),
+        ("slides", "Слайдов"), ("deadline", "Срок"),
+    ):
+        value = brief.get(key)
+        if value not in (None, ""):
+            lines.append(f"{label}: {value}")
+    if notes:
+        lines.append(f"Дополнительная информация: {notes}")
+    lines.append(f"Файлов: {len(attachments)}")
+    keyboard = order_action_menu(order_id) if status == "admin_review" else None
+    await bot.send_message(admin_chat_id, "\\n".join(lines), reply_markup=keyboard)
+    for item in attachments:
+        try:
+            if item.file_type == "photo":
+                await bot.send_photo(admin_chat_id, item.telegram_file_id)
+            else:
+                await bot.send_document(admin_chat_id, item.telegram_file_id)
+        except Exception:
+            await bot.send_message(admin_chat_id, f"Не удалось повторно отправить вложение заявки {order_id[:8]}.")
+    return True
 
 
 async def get_client(db, user):
