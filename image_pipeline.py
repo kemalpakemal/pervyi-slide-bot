@@ -188,7 +188,7 @@ def compose_slide(
         canvas = ImageOps.fit(background, (width, height), method=Image.Resampling.LANCZOS).convert("RGBA")
 
         product = Image.open(cutout_path).convert("RGBA")
-        product.thumbnail((920, 960), Image.Resampling.LANCZOS)
+        product.thumbnail((920, 850), Image.Resampling.LANCZOS)
         alpha = product.getchannel("A")
 
         # Soft contact shadow, kept separate from the untouched original product pixels.
@@ -270,8 +270,8 @@ def make_watermarked_demo(
     tile_draw.text((12, 9), watermark_text, font=tile_font, fill=(255, 255, 255, 112))
     rotated = tile.rotate(28, resample=Image.Resampling.BICUBIC, expand=True)
 
-    for y in range(-height, height * 2, 210):
-        for x in range(-width, width * 2, max(300, width - 90)):
+    for y in range(0, height, 210):
+        for x in range(0, width, max(300, width - 90)):
             overlay.alpha_composite(rotated, (x, y))
 
     image = Image.alpha_composite(image, overlay)
