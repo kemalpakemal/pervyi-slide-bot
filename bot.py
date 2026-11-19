@@ -918,40 +918,11 @@ async def generate_from_order_button(call: CallbackQuery):
 async def generate_order_design(message: Message):
     if message.from_user.id != settings.admin_id:
         return
-
-    parts = (message.text or "").split(maxsplit=1)
-    prefix = parts[1].strip() if len(parts) > 1 else ""
-
-    async with Session() as db:
-        if prefix:
-            if len(prefix) < 8:
-                await message.answer("Для поиска заявки укажи минимум 8 символов ID.")
-                return
-            matches = list((await db.scalars(
-                select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
-            )).all())
-            if not matches:
-                await message.answer("Заявка с таким ID не найдена.")
-                return
-            if len(matches) > 1:
-                await message.answer("Найдено несколько заявок. Укажи больше символов ID.")
-                return
-            order = matches[0]
-        else:
-            order = await db.scalar(
-                select(Order)
-                .where(Order.status == "accepted")
-                .order_by(Order.created_at.desc())
-                .limit(1)
-            )
-            if order is None:
-                await message.answer(
-                    "Нет принятых заявок для генерации. Сначала прими заявку из уведомления."
-                )
-                return
-        order_id = order.id
-
-    await generate_order_for_admin(message.bot, message.chat.id, order_id)
+    await message.answer(
+        "Автогенерация через OctavApi отключена из-за повторяющейся ошибки 502/5002. "
+        "Создай изображение в ChatGPT, поделись им с @pervy_slide_bot, "
+        "затем ответь на фото командой /demo ID заявки."
+    )
 
 
 @router.callback_query(F.data.startswith("design:"))
