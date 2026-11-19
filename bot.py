@@ -231,7 +231,7 @@ def order_action_menu(order_id: str):
 
 def generate_order_menu(order_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Сгенерировать демо", callback_data=f"order:generate:{order_id}")]
+        [InlineKeyboardButton(text="Сгенерировать демо", callback_data=f"generate-order:{order_id}")]
     ])
 
 
@@ -875,12 +875,12 @@ async def generate_order_for_admin(bot: Bot, admin_chat_id: int, order_id: str):
         )
 
 
-@router.callback_query(F.data.startswith("order:generate:"))
+@router.callback_query(F.data.startswith("generate-order:"))
 async def generate_from_order_button(call: CallbackQuery):
     if call.from_user.id != settings.admin_id:
         await call.answer("Только администратор может запускать генерацию.", show_alert=True)
         return
-    order_id = call.data.split(":", 2)[2]
+    order_id = call.data.split(":", 1)[1]
     async with Session() as db:
         order = await db.get(Order, order_id)
         if order is None:
@@ -889,10 +889,7 @@ async def generate_from_order_button(call: CallbackQuery):
         if order.status != "accepted":
             await call.answer(f"Заявка сейчас в статусе {order.status}.", show_alert=True)
             return
-        order.status = "generation_queued"
-        await db.commit()
-
-    await call.answer("Генерация запущена.")
+    await call.answer("Генерация запускается.")
     await call.message.edit_reply_markup(reply_markup=None)
     await generate_order_for_admin(call.bot, call.message.chat.id, order_id)
 
