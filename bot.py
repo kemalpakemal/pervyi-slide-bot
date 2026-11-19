@@ -213,10 +213,18 @@ async def start(message: Message, state: FSMContext):
         client = await get_client(db, message.from_user)
         client.stopped = False
         await db.commit()
+    welcome = (
+        "Здравствуйте! Я помощник студии «Первый слайд». "
+        "Помогу оформить заявку на создание карточки товара. "
+        "На ключевых этапах работу проверяет администратор."
+    )
     if message.from_user.id == settings.admin_id:
-        await message.answer("Панель администратора «Первый слайд». Команды: /orders, /health, /order, /paid, /remind", reply_markup=menu())
-    else:
-        await message.answer("Здравствуйте! Я помощник студии «Первый слайд». Помогу оформить заявку на создание карточки товара. На ключевых этапах работу проверяет администратор.", reply_markup=menu())
+        welcome += (
+            "\\n\\nРежим администратора активен. "
+            "Команды управления: /orders, /health, /order, /paid, /remind. "
+            "При этом ты можешь пользоваться ботом как обычный клиент и проверять оформление заказа."
+        )
+    await message.answer(welcome, reply_markup=menu())
 
 
 @router.message(F.text == "Заказать карточку")
