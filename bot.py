@@ -243,7 +243,7 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
         lines.append(f"Дополнительная информация: {notes}")
     lines.append(f"Файлов: {len(attachments)}")
     keyboard = order_action_menu(order_id) if status == "admin_review" else None
-    await bot.send_message(admin_chat_id, "\\n".join(lines), reply_markup=keyboard)
+    await bot.send_message(admin_chat_id, "\n".join(lines), reply_markup=keyboard)
     for item in attachments:
         try:
             if item.file_type == "photo":
@@ -280,7 +280,7 @@ async def start(message: Message, state: FSMContext):
     )
     if message.from_user.id == settings.admin_id:
         welcome += (
-            "\\n\\nРежим администратора активен. "
+            "\n\nРежим администратора активен. "
             "Команды управления: /orders, /health, /order, /paid, /remind. "
             "При этом ты можешь пользоваться ботом как обычный клиент и проверять оформление заказа."
         )
@@ -534,7 +534,7 @@ async def send_clarification_to_client(message: Message, state: FSMContext):
         client_telegram_id = client.telegram_id if client else None
         order.status = "waiting_client_info"
         previous = order.assistant_notes or ""
-        order.assistant_notes = (previous + "\\n" if previous else "") + f"Уточнение от студии: {text}"
+        order.assistant_notes = (previous + "\n" if previous else "") + f"Уточнение от студии: {text}"
         await db.commit()
 
     await state.clear()
@@ -542,7 +542,7 @@ async def send_clarification_to_client(message: Message, state: FSMContext):
         try:
             await message.bot.send_message(
                 client_telegram_id,
-                f"По заявке №{order_id[:8]} нужно уточнение:\\n\\n{text}\\n\\n"
+                f"По заявке №{order_id[:8]} нужно уточнение:\n\n{text}\n\n"
                 "Ответь следующим сообщением в этом чате — я передам ответ администратору."
             )
             await message.answer("Уточнение отправлено клиенту. Жду его ответ.")
@@ -781,7 +781,7 @@ async def forward_client_clarification(message: Message):
             return
         order_id = order.id
         previous = order.assistant_notes or ""
-        order.assistant_notes = previous + f"\\nОтвет клиента: {message.text[:3000]}"
+        order.assistant_notes = previous + f"\nОтвет клиента: {message.text[:3000]}"
         order.status = "admin_review"
         await db.commit()
 
