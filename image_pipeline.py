@@ -29,56 +29,73 @@ def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.I
     return ImageFont.load_default()
 
 
-class YandexImageProvider:
-    """OpenAI-compatible image-generation endpoint in Yandex AI Studio."""
+class OpenAIImageProvider:
+    """Direct Images API client for GPT Image 2.6."""
 
     def __init__(
         self,
         api_key: str,
-        folder_id: str,
-        model: str = "aliceai-image-art-3.0",
+        model: str = "gpt-image-2.6-sunburst",
         size: str = "1024x1536",
+        quality: str = "medium",
+        complexity: str = "medium",
     ):
-        if not api_key.strip() or not folder_id.strip():
+        if not api_key.strip():
             raise ImagePipelineError(
-                "Не настроен Yandex AI Studio: нужны YANDEX_API_KEY и YANDEX_FOLDER_ID."
+                "Не задан OPENAI_API_KEY. Добавь API-ключ в Railway → Variables."
             )
         self.api_key = api_key.strip()
-        self.folder_id = folder_id.strip()
         self.model = model.strip()
         self.size = size.strip()
+        self.quality = quality.strip()
+        self.complexity = complexity.strip()
 
-    async def generate(self, prompt: str, destination: Path) -> Path:
-        # Yandex AI Studio documents a 500-character prompt limit for this API.
-        prompt = " ".join(prompt.split())[:500]
+    async def generate(
+        self,
+        prompt: str,
+        destination: Path,
+        safety_identifier: str | None = None,
+    ) -> Path:
+        prompt = " ".join(prompt.split())
         if not prompt:
             raise ImagePipelineError("Пустое описание фона.")
 
-        url = "https://ai.api.cloud.yandex.net/v1/images/generations"
+        url = "https://api.openai.com/v1/images/generations"
         headers = {
-            "Authorization": f"Api-Key {self.api_key}",
-            "OpenAI-Project": self.folder_id,
+            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
         payload = {
-            "model": f"art://{self.folder_id}/{self.model}",
+            "model": self.model,
             "prompt": prompt,
             "size": self.size,
+            "quality": self.quality,
+            "complexity": self.complexity,
+            "output_format": "png",
             "n": 1,
         }
+        if safety_identifier:
+            payload["safety_identifier"] = safety_identifier[:128]
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=30.0)) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(240.0, connect=30.0)
+            ) as client:
                 response = await client.post(url, headers=headers, json=payload)
-                response.raise_for_status()
+                if response.is_error:
+                    try:
+                        error_body = response.json().get("error", {})
+                        detail = error_body.get("message") or response.text[:900]
+                    except ValueError:
+                        detail = response.text[:900]
+                    raise ImagePipelineError(
+                        f"OpenAI Images API: HTTP {response.status_code}: {detail}"
+                    )
                 body = response.json()
-        except httpx.HTTPStatusError as exc:
-            detail = exc.response.text[:700]
-            raise ImagePipelineError(
-                f"Yandex AI Studio вернул HTTP {exc.response.status_code}: {detail}"
-            ) from exc
+        except ImagePipelineError:
+            raise
         except (httpx.HTTPError, ValueError) as exc:
-            raise ImagePipelineError(f"Не удалось связаться с Yandex AI Studio: {exc}") from exc
+            raise ImagePipelineError(f"Ошибка соединения с OpenAI Images API: {exc}") from exc
 
         try:
             encoded = body["data"][0]["b64_json"]
@@ -87,10 +104,9 @@ class YandexImageProvider:
                 image.convert("RGB").save(destination, format="JPEG", quality=94)
         except Exception as exc:
             raise ImagePipelineError(
-                "Yandex AI Studio ответил, но изображение не удалось прочитать."
+                "OpenAI вернул ответ, но изображение не удалось прочитать."
             ) from exc
         return destination
-
 
 def cutout_product(source_path: Path, destination: Path, model_name: str = "u2netp") -> Path:
     """Remove the background from the seller's original photo; never regenerate the product."""
