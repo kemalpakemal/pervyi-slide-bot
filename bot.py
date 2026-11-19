@@ -512,6 +512,10 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
             "Стоимость и сроки будут отдельно согласованы. Пока ничего оплачивать не нужно."
         )
         await call.answer("Заявка принята.")
+        await call.bot.send_message(
+            settings.admin_id,
+            f"Следующий шаг для заявки {order_id[:8]}: запусти /generate {order_id[:8]}."
+        )
     else:
         client_message = (
             f"К сожалению, студия пока не может принять заявку №{order_id[:8]}. "
