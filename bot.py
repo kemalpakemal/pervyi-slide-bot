@@ -22,14 +22,7 @@ from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from image_pipeline import (
-    ImagePipelineError,
-    OctavApiImageProvider,
-    build_background_prompt,
-    compose_slide,
-    cutout_product,
-    make_watermarked_demo,
-)
+from image_pipeline import ImagePipelineError, make_watermarked_demo
 
 
 class Settings(BaseSettings):
@@ -39,17 +32,8 @@ class Settings(BaseSettings):
     storage_path: Path = Path("./data")
     max_file_mb: int = 15
     max_files_per_order: int = 12
-    image_provider: str = "octavapi"
-    octavapi_api_key: str | None = None
-    octavapi_base_url: str = "https://octavapi.shop/v1"
-    octavapi_image_model: str = "image_gen"
-    octavapi_image_size: str = "1024x1024"
-    remove_bg_model: str = "u2netp"
-    output_width: int = 1200
-    output_height: int = 1600
     demo_long_edge: int = 700
     demo_watermark_text: str = "ПЕРВЫЙ СЛАЙД • ДЕМО"
-    max_generation_slides: int = 10
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
@@ -723,183 +707,6 @@ def parse_benefits(value) -> list[str]:
         source = str(value or "")
     items = [item.strip(" \t\r•-") for item in re.split(r"[\n;,]+", source)]
     return [item for item in items if item][:5]
-
-
-async def generate_order_for_admin(bot: Bot, admin_chat_id: int, order_id: str):
-    """Generate demo images for a previously accepted order."""
-    if settings.image_provider.lower() != "octavapi":
-        await bot.send_message(admin_chat_id, "Провайдер генерации не настроен на OctavApi.")
-        return
-
-    if not settings.octavapi_api_key:
-        await bot.send_message(
-            admin_chat_id,
-            "Не задан OCTAVAPI_API_KEY. Добавь API-ключ OctavApi в Railway → pervyi-slide-bot → Variables. "
-            "Пока генерация не запустится."
-        )
-        return
-
-    async with Session() as db:
-        order = await db.get(Order, order_id)
-        if order is None:
-            await bot.send_message(admin_chat_id, "Заявка не найдена.")
-            return
-        if order.status not in {"accepted", "demo_review", "demo_sent"}:
-            await bot.send_message(admin_chat_id, f"Заявка {order_id[:8]} не готова к генерации. Статус: {order.status}.")
-            return
-        attachments = list((await db.scalars(
-            select(OrderFile).where(OrderFile.order_id == order.id).order_by(OrderFile.id)
-        )).all())
-        brief = dict(order.brief or {})
-        order.status = "generating"
-        await db.commit()
-
-    product_file = next(
-        (item for item in attachments if item.file_type in {"photo", "document"}),
-        None,
-    )
-    if product_file is None:
-        async with Session() as db:
-            order = await db.get(Order, order_id)
-            if order:
-                order.status = "accepted"
-                await db.commit()
-        await bot.send_message(admin_chat_id, "В заявке нет фото товара. Попроси клиента прислать изображение.")
-        return
-
-    order_dir = settings.storage_path / "orders" / order_id
-    order_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        telegram_file = await bot.get_file(product_file.telegram_file_id)
-        original_ext = Path(telegram_file.file_path or "").suffix.lower()
-        if original_ext not in {".jpg", ".jpeg", ".png", ".webp"}:
-            original_ext = Path(product_file.original_name or "").suffix.lower()
-        if original_ext not in {".jpg", ".jpeg", ".png", ".webp"}:
-            original_ext = ".jpg"
-
-        original_path = order_dir / f"product_original{original_ext}"
-        await bot.download_file(telegram_file.file_path, destination=original_path)
-
-        try:
-            slide_count = int(brief.get("slides", 1))
-        except (TypeError, ValueError):
-            slide_count = 1
-        slide_count = min(max(slide_count, 1), settings.max_generation_slides)
-
-        await bot.send_message(
-            admin_chat_id,
-            f"Генерирую демо по заявке {order_id[:8]}: {slide_count} слайда(ов)."
-        )
-
-        cutout_path = order_dir / "product_cutout.png"
-        await asyncio.to_thread(
-            cutout_product, original_path, cutout_path, settings.remove_bg_model
-        )
-
-        provider = OctavApiImageProvider(
-            api_key=settings.octavapi_api_key,
-            base_url=settings.octavapi_base_url,
-            model=settings.octavapi_image_model,
-            size=settings.octavapi_image_size,
-        )
-
-        product_name = str(brief.get("product") or "Товар")
-        style = str(brief.get("style") or "современный минимализм")
-        colors = str(brief.get("colors") or "нейтральные цвета")
-        benefits = parse_benefits(brief.get("advantages"))
-        generated_assets = []
-
-        for slide_number in range(1, slide_count + 1):
-            background_path = order_dir / f"background_{slide_number:02d}.jpg"
-            final_path = order_dir / f"final_{slide_number:02d}.png"
-            demo_path = order_dir / f"demo_{slide_number:02d}.jpg"
-
-            prompt = build_background_prompt(
-                product_name, style, colors, slide_number
-            )
-            safety_id = __import__("hashlib").sha256(
-                f"pervyi-slide:{order_id}".encode("utf-8")
-            ).hexdigest()
-            await provider.generate(prompt, background_path, safety_identifier=safety_id)
-
-            await asyncio.to_thread(
-                compose_slide,
-                background_path,
-                cutout_path,
-                final_path,
-                product_name,
-                benefits,
-                slide_number,
-                settings.output_width,
-                settings.output_height,
-            )
-            await asyncio.to_thread(
-                make_watermarked_demo,
-                final_path,
-                demo_path,
-                settings.demo_long_edge,
-                settings.demo_watermark_text,
-            )
-            generated_assets.append({
-                "slide": slide_number,
-                "final_path": str(final_path),
-                "demo_path": str(demo_path),
-            })
-
-        async with Session() as db:
-            order = await db.get(Order, order_id)
-            if order is None:
-                raise ImagePipelineError("Заявка была удалена во время генерации.")
-            updated_brief = dict(order.brief or {})
-            updated_brief["design_assets"] = generated_assets
-            order.brief = updated_brief
-            order.status = "demo_review"
-            await db.commit()
-
-        for asset in generated_assets:
-            await bot.send_photo(
-                admin_chat_id,
-                FSInputFile(asset["demo_path"]),
-                caption=f"Заявка {order_id[:8]} · демо-слайд {asset['slide']}",
-            )
-        await bot.send_message(
-            admin_chat_id,
-            f"Демо по заявке {order_id[:8]} готово. Проверь и отправь клиенту только после проверки.",
-            reply_markup=design_review_menu(order_id),
-        )
-
-    except ImagePipelineError as exc:
-        async with Session() as db:
-            order = await db.get(Order, order_id)
-            if order and order.status == "generating":
-                order.status = "accepted"
-                await db.commit()
-        await bot.send_message(admin_chat_id, f"Генерация остановлена: {exc}")
-    except Exception as exc:
-        async with Session() as db:
-            order = await db.get(Order, order_id)
-            if order and order.status == "generating":
-                order.status = "accepted"
-                await db.commit()
-        await bot.send_message(
-            admin_chat_id,
-            "Не удалось завершить генерацию. Заявка сохранена, статус возвращён на «Принята». "
-            f"Ошибка: {type(exc).__name__}: {str(exc)[:350]}"
-        )
-
-
-@router.callback_query(F.data.startswith("generate-order:"))
-async def generate_from_order_button(call: CallbackQuery):
-    if call.from_user.id != settings.admin_id:
-        await call.answer("Только администратор может запускать генерацию.", show_alert=True)
-        return
-    order_id = call.data.split(":", 1)[1]
-    await call.answer()
-    await call.message.answer(
-        f"Для заявки {order_id[:8]} используется генерация через ChatGPT: "
-        "создай изображение здесь, поделись им с @pervy_slide_bot "
-        f"и ответь на фото командой /demo {order_id[:8]}."
-    )
 
 
 @router.message(Command("generate"))
