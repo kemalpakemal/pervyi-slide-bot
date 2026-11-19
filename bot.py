@@ -894,24 +894,12 @@ async def generate_from_order_button(call: CallbackQuery):
         await call.answer("Только администратор может запускать генерацию.", show_alert=True)
         return
     order_id = call.data.split(":", 1)[1]
-    if not settings.openai_api_key:
-        await call.answer("Не задан OPENAI_API_KEY. Кнопка останется доступной.", show_alert=True)
-        await call.message.answer(
-            "Чтобы запустить генерацию, сначала добавь OPENAI_API_KEY в Railway → Variables. "
-            "После этого нажми «Сгенерировать демо» ещё раз."
-        )
-        return
-    async with Session() as db:
-        order = await db.get(Order, order_id)
-        if order is None:
-            await call.answer("Заявка не найдена.", show_alert=True)
-            return
-        if order.status != "accepted":
-            await call.answer(f"Заявка сейчас в статусе {order.status}.", show_alert=True)
-            return
-    await call.answer("Генерация запускается.")
-    await call.message.edit_reply_markup(reply_markup=None)
-    await generate_order_for_admin(call.bot, call.message.chat.id, order_id)
+    await call.answer()
+    await call.message.answer(
+        f"Для заявки {order_id[:8]} используется генерация через ChatGPT: "
+        "создай изображение здесь, поделись им с @pervy_slide_bot "
+        f"и ответь на фото командой /demo {order_id[:8]}."
+    )
 
 
 @router.message(Command("generate"))
