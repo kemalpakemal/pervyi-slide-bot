@@ -29,26 +29,24 @@ def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.I
     return ImageFont.load_default()
 
 
-class OpenAIImageProvider:
-    """Direct Images API client for GPT Image 2.6."""
+class OctavApiImageProvider:
+    """Image generation client for OctavApi's documented Images endpoint."""
 
     def __init__(
         self,
         api_key: str,
-        model: str = "gpt-image-2.6-sunburst",
-        size: str = "1024x1536",
-        quality: str = "medium",
-        complexity: str = "medium",
+        base_url: str = "https://octavapi.shop/v1",
+        model: str = "image_gen",
+        size: str = "1024x1024",
     ):
         if not api_key.strip():
             raise ImagePipelineError(
-                "Не задан OPENAI_API_KEY. Добавь API-ключ в Railway → Variables."
+                "Не задан OCTAVAPI_API_KEY. Добавь ключ OctavApi в Railway → Variables."
             )
         self.api_key = api_key.strip()
+        self.base_url = base_url.rstrip("/")
         self.model = model.strip()
         self.size = size.strip()
-        self.quality = quality.strip()
-        self.complexity = complexity.strip()
 
     async def generate(
         self,
@@ -60,7 +58,7 @@ class OpenAIImageProvider:
         if not prompt:
             raise ImagePipelineError("Пустое описание фона.")
 
-        url = "https://api.openai.com/v1/images/generations"
+        url = f"{self.base_url}/images/generations"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -69,42 +67,78 @@ class OpenAIImageProvider:
             "model": self.model,
             "prompt": prompt,
             "size": self.size,
-            "quality": self.quality,
-            "complexity": self.complexity,
-            "output_format": "png",
-            "n": 1,
         }
-        if safety_identifier:
-            payload["safety_identifier"] = safety_identifier[:128]
 
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(240.0, connect=30.0)
+                timeout=httpx.Timeout(240.0, connect=30.0),
+                follow_redirects=True,
             ) as client:
                 response = await client.post(url, headers=headers, json=payload)
                 if response.is_error:
                     try:
-                        error_body = response.json().get("error", {})
-                        detail = error_body.get("message") or response.text[:900]
-                    except ValueError:
+                        parsed_error = response.json()
+                        detail = (
+                            parsed_error.get("error", {}).get("message")
+                            if isinstance(parsed_error.get("error"), dict)
+                            else parsed_error.get("error")
+                        ) or parsed_error.get("message") or response.text[:900]
+                    except (ValueError, AttributeError):
                         detail = response.text[:900]
                     raise ImagePipelineError(
-                        f"OpenAI Images API: HTTP {response.status_code}: {detail}"
+                        f"OctavApi Images: HTTP {response.status_code}: {detail}"
                     )
                 body = response.json()
+
+                # Accept only common image response representations. If the
+                # gateway returns a different schema, fail with a safe diagnostic.
+                data = body.get("data") if isinstance(body, dict) else None
+                item = data[0] if isinstance(data, list) and data else None
+                if not isinstance(item, dict):
+                    item = body.get("output") if isinstance(body, dict) else None
+                    if isinstance(item, list) and item and isinstance(item[0], dict):
+                        item = item[0]
+
+                encoded = None
+                image_url = None
+                if isinstance(item, dict):
+                    encoded = item.get("b64_json") or item.get("base64")
+                    image_url = item.get("url") or item.get("image_url")
+                if not encoded and not image_url and isinstance(body, dict):
+                    encoded = body.get("b64_json") or body.get("base64")
+                    image_url = body.get("url") or body.get("image_url")
+
+                if encoded:
+                    try:
+                        image_bytes = base64.b64decode(encoded, validate=True)
+                    except Exception as exc:
+                        raise ImagePipelineError(
+                            "OctavApi вернул некорректные base64-данные изображения."
+                        ) from exc
+                elif image_url:
+                    image_response = await client.get(str(image_url))
+                    image_response.raise_for_status()
+                    image_bytes = image_response.content
+                else:
+                    keys = ", ".join(sorted(body.keys())) if isinstance(body, dict) else type(body).__name__
+                    raise ImagePipelineError(
+                        "OctavApi принял запрос, но вернул неизвестный формат ответа. "
+                        f"Поля верхнего уровня: {keys}. Нужен пример JSON-ответа из документации."
+                    )
+
+                try:
+                    with Image.open(io.BytesIO(image_bytes)) as image:
+                        image.convert("RGB").save(destination, format="JPEG", quality=94)
+                except Exception as exc:
+                    raise ImagePipelineError(
+                        "OctavApi вернул данные, которые не удалось открыть как изображение."
+                    ) from exc
+
         except ImagePipelineError:
             raise
         except (httpx.HTTPError, ValueError) as exc:
-            raise ImagePipelineError(f"Ошибка соединения с OpenAI Images API: {exc}") from exc
-
-        try:
-            encoded = body["data"][0]["b64_json"]
-            image_bytes = base64.b64decode(encoded, validate=True)
-            with Image.open(io.BytesIO(image_bytes)) as image:
-                image.convert("RGB").save(destination, format="JPEG", quality=94)
-        except Exception as exc:
             raise ImagePipelineError(
-                "OpenAI вернул ответ, но изображение не удалось прочитать."
+                f"Ошибка соединения с OctavApi Images: {type(exc).__name__}: {str(exc)[:300]}"
             ) from exc
         return destination
 
