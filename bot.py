@@ -24,7 +24,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from image_pipeline import (
     ImagePipelineError,
-    YandexImageProvider,
+    OpenAIImageProvider,
     build_background_prompt,
     compose_slide,
     cutout_product,
@@ -39,11 +39,12 @@ class Settings(BaseSettings):
     storage_path: Path = Path("./data")
     max_file_mb: int = 15
     max_files_per_order: int = 12
-    image_provider: str = "yandex_art"
-    yandex_api_key: str | None = None
-    yandex_folder_id: str | None = None
-    yandex_image_model: str = "aliceai-image-art-3.0"
-    yandex_image_size: str = "1024x1536"
+    image_provider: str = "openai"
+    openai_api_key: str | None = None
+    openai_image_model: str = "gpt-image-2.6-sunburst"
+    openai_image_size: str = "1024x1536"
+    openai_image_quality: str = "medium"
+    openai_image_complexity: str = "medium"
     remove_bg_model: str = "u2netp"
     output_width: int = 1200
     output_height: int = 1600
@@ -714,15 +715,14 @@ async def generate_order_design(message: Message):
         await message.answer("Укажи ID заявки. Пример: /generate 2c19e81f")
         return
 
-    if settings.image_provider.lower() != "yandex_art":
-        await message.answer("Сейчас настроен неподдерживаемый IMAGE_PROVIDER. Для генерации выбран Yandex AI Studio.")
+    if settings.image_provider.lower() != "openai":
+        await message.answer("Провайдер генерации не настроен на OpenAI. Обратись к администратору.")
         return
-    if not settings.yandex_api_key or not settings.yandex_folder_id:
+    if not settings.openai_api_key:
         await message.answer(
-            "Генератор собран, но для запуска не хватает двух секретов Yandex AI Studio:\n"
-            "1. YANDEX_API_KEY\n2. YANDEX_FOLDER_ID\n\n"
-            "Добавь их в Railway → pervyi-slide-bot → Variables. "
-            "Не присылай API-ключ в чат."
+            "GPT Image 2.6 подключён в коде, но отсутствует OPENAI_API_KEY. "
+            "Добавь ключ в Railway → pervyi-slide-bot → Variables. "
+            "Не отправляй ключ в Telegram или чат."
         )
         return
 
@@ -786,11 +786,12 @@ async def generate_order_design(message: Message):
             cutout_product, original_path, cutout_path, settings.remove_bg_model
         )
 
-        provider = YandexImageProvider(
-            api_key=settings.yandex_api_key,
-            folder_id=settings.yandex_folder_id,
-            model=settings.yandex_image_model,
-            size=settings.yandex_image_size,
+        provider = OpenAIImageProvider(
+            api_key=settings.openai_api_key,
+            model=settings.openai_image_model,
+            size=settings.openai_image_size,
+            quality=settings.openai_image_quality,
+            complexity=settings.openai_image_complexity,
         )
 
         try:
@@ -813,7 +814,10 @@ async def generate_order_design(message: Message):
             prompt = build_background_prompt(
                 product_name, style, colors, slide_number
             )
-            await provider.generate(prompt, background_path)
+            safety_id = __import__("hashlib").sha256(
+                f"pervyi-slide:{order_id}".encode("utf-8")
+            ).hexdigest()
+            await provider.generate(prompt, background_path, safety_identifier=safety_id)
 
             await asyncio.to_thread(
                 compose_slide,
