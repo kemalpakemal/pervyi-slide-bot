@@ -24,7 +24,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from image_pipeline import (
     ImagePipelineError,
-    OpenAIImageProvider,
+    OctavApiImageProvider,
     build_background_prompt,
     compose_slide,
     cutout_product,
@@ -39,12 +39,11 @@ class Settings(BaseSettings):
     storage_path: Path = Path("./data")
     max_file_mb: int = 15
     max_files_per_order: int = 12
-    image_provider: str = "openai"
-    openai_api_key: str | None = None
-    openai_image_model: str = "gpt-image-2.6-sunburst"
-    openai_image_size: str = "1024x1536"
-    openai_image_quality: str = "medium"
-    openai_image_complexity: str = "medium"
+    image_provider: str = "octavapi"
+    octavapi_api_key: str | None = None
+    octavapi_base_url: str = "https://octavapi.shop/v1"
+    octavapi_image_model: str = "image_gen"
+    octavapi_image_size: str = "1024x1024"
     remove_bg_model: str = "u2netp"
     output_width: int = 1200
     output_height: int = 1600
@@ -724,14 +723,14 @@ def parse_benefits(value) -> list[str]:
 
 async def generate_order_for_admin(bot: Bot, admin_chat_id: int, order_id: str):
     """Generate demo images for a previously accepted order."""
-    if settings.image_provider.lower() != "openai":
-        await bot.send_message(admin_chat_id, "Провайдер генерации не настроен на OpenAI.")
+    if settings.image_provider.lower() != "octavapi":
+        await bot.send_message(admin_chat_id, "Провайдер генерации не настроен на OctavApi.")
         return
 
-    if not settings.openai_api_key:
+    if not settings.octavapi_api_key:
         await bot.send_message(
             admin_chat_id,
-            "Не задан OPENAI_API_KEY. Добавь API-ключ в Railway → pervyi-slide-bot → Variables. "
+            "Не задан OCTAVAPI_API_KEY. Добавь API-ключ OctavApi в Railway → pervyi-slide-bot → Variables. "
             "Пока генерация не запустится."
         )
         return
@@ -793,12 +792,11 @@ async def generate_order_for_admin(bot: Bot, admin_chat_id: int, order_id: str):
             cutout_product, original_path, cutout_path, settings.remove_bg_model
         )
 
-        provider = OpenAIImageProvider(
-            api_key=settings.openai_api_key,
-            model=settings.openai_image_model,
-            size=settings.openai_image_size,
-            quality=settings.openai_image_quality,
-            complexity=settings.openai_image_complexity,
+        provider = OctavApiImageProvider(
+            api_key=settings.octavapi_api_key,
+            base_url=settings.octavapi_base_url,
+            model=settings.octavapi_image_model,
+            size=settings.octavapi_image_size,
         )
 
         product_name = str(brief.get("product") or "Товар")
