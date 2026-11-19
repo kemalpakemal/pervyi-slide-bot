@@ -230,7 +230,7 @@ def order_action_menu(order_id: str):
 
 def generate_order_menu(order_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Сгенерировать демо", callback_data=f"generate-order:{order_id}")]
+        [InlineKeyboardButton(text="Как передать готовое демо", callback_data=f"manual-demo-help:{order_id}")]
     ])
 
 
@@ -519,8 +519,12 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
         )
         await call.answer("Заявка принята.")
         await call.message.answer(
-            f"Заявка {order_id[:8]} принята. Для запуска генерации нажми кнопку ниже.",
-            reply_markup=generate_order_menu(order_id),
+            f"Заявка {order_id[:8]} принята.\n\n"
+            "Чтобы сделать макет через ChatGPT: отправь в ChatGPT фото товара и бриф этой заявки. "
+            "Когда изображение будет готово, нажми «Поделиться» → Telegram → @pervy_slide_bot.\n\n"
+            f"Затем ответь на полученное фото командой /demo {order_id[:8]}. "
+            "Бот сохранит оригинал, наложит водяной знак и покажет демо. "
+            "Клиент получит его только после твоего нажатия «Отправить демо клиенту».",
         )
     else:
         client_message = (
@@ -1028,6 +1032,146 @@ async def process_design_action(call: CallbackQuery):
     await call.message.edit_reply_markup(reply_markup=None)
     await call.answer("Демо отправлено клиенту.")
     await call.message.answer(f"Демо по заявке {order_id[:8]} отправлено. Оригиналы остаются в закрытом хранилище.")
+
+
+
+
+@router.callback_query(F.data.startswith("manual-demo-help:"))
+async def manual_demo_help(call: CallbackQuery):
+    if call.from_user.id != settings.admin_id:
+        await call.answer("Только администратор может использовать эту функцию.", show_alert=True)
+        return
+    order_id = call.data.split(":", 1)[1]
+    await call.answer()
+    await call.message.answer(
+        "Порядок передачи готового изображения из ChatGPT:\n"
+        "1. Создай макет в ChatGPT по брифу и фото товара.\n"
+        "2. Нажми «Поделиться» → Telegram → @pervy_slide_bot.\n"
+        f"3. Ответь на фото командой /demo {order_id[:8]}.\n"
+        "Бот сохранит оригинал, наложит водяной знак и покажет кнопку отправки демо заказчику."
+    )
+
+
+@router.message(Command("demo"))
+async def attach_chatgpt_demo(message: Message):
+    if message.from_user.id != settings.admin_id:
+        return
+
+    parts = (message.text or message.caption or "").split(maxsplit=1)
+    if len(parts) < 2 or len(parts[1].strip()) < 8:
+        await message.answer("Ответь на изображение командой /demo ID. Например: /demo 2c19e81f.")
+        return
+    prefix = parts[1].strip()
+
+    source_message = message if (message.photo or message.document) else message.reply_to_message
+    if source_message is None:
+        await message.answer(
+            "Сначала поделись готовым изображением из ChatGPT в этот чат, "
+            "затем ответь на него командой /demo ID."
+        )
+        return
+
+    telegram_file_id = None
+    file_size = None
+    file_name = None
+    if source_message.photo:
+        media = source_message.photo[-1]
+        telegram_file_id = media.file_id
+        file_size = media.file_size
+        file_name = "chatgpt_demo.jpg"
+    elif source_message.document:
+        media = source_message.document
+        if not (media.mime_type or "").startswith("image/"):
+            await message.answer("Нужен файл изображения JPG, PNG или WEBP.")
+            return
+        telegram_file_id = media.file_id
+        file_size = media.file_size
+        file_name = media.file_name or "chatgpt_demo.png"
+    else:
+        await message.answer("Команда /demo должна быть ответом на изображение.")
+        return
+
+    if file_size and file_size > settings.max_file_mb * 1024 * 1024:
+        await message.answer(f"Изображение превышает лимит {settings.max_file_mb} МБ.")
+        return
+
+    async with Session() as db:
+        matches = list((await db.scalars(
+            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
+        )).all())
+        if not matches:
+            await message.answer("Заявка с таким ID не найдена.")
+            return
+        if len(matches) > 1:
+            await message.answer("Нашлось несколько заявок. Укажи больше символов ID.")
+            return
+        order = matches[0]
+        if order.status not in {"accepted", "demo_review", "demo_sent"}:
+            await message.answer(f"Сначала прими заявку. Сейчас её статус: {order.status}.")
+            return
+        order_id = order.id
+        brief = dict(order.brief or {})
+        current_assets = list(brief.get("design_assets", []))
+
+    order_dir = settings.storage_path / "orders" / order_id
+    order_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        telegram_file = await message.bot.get_file(telegram_file_id)
+        original_ext = Path(telegram_file.file_path or "").suffix.lower()
+        if original_ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+            original_ext = Path(file_name or "").suffix.lower()
+        if original_ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+            original_ext = ".jpg"
+
+        slide_number = len(current_assets) + 1
+        final_path = order_dir / f"chatgpt_final_{slide_number:02d}{original_ext}"
+        demo_path = order_dir / f"chatgpt_demo_{slide_number:02d}.jpg"
+
+        await message.bot.download_file(telegram_file.file_path, destination=final_path)
+        await asyncio.to_thread(
+            make_watermarked_demo,
+            final_path,
+            demo_path,
+            settings.demo_long_edge,
+            settings.demo_watermark_text,
+        )
+
+        asset = {
+            "slide": slide_number,
+            "final_path": str(final_path),
+            "demo_path": str(demo_path),
+            "source": "chatgpt_manual",
+        }
+
+        async with Session() as db:
+            order = await db.get(Order, order_id)
+            if order is None:
+                raise ImagePipelineError("Заявка не найдена при сохранении изображения.")
+            updated_brief = dict(order.brief or {})
+            updated_assets = list(updated_brief.get("design_assets", []))
+            updated_assets.append(asset)
+            updated_brief["design_assets"] = updated_assets
+            order.brief = updated_brief
+            order.status = "demo_review"
+            await db.commit()
+
+        await message.answer_photo(
+            FSInputFile(demo_path),
+            caption=f"Демо по заявке {order_id[:8]} · слайд {slide_number}. Проверь результат.",
+            reply_markup=design_review_menu(order_id),
+        )
+        await message.answer(
+            "Изображение сохранено. Клиенту оно ещё не отправлено. "
+            "После проверки нажми «Отправить демо клиенту» под превью."
+        )
+    except ImagePipelineError as exc:
+        await message.answer(f"Не удалось подготовить демо: {exc}")
+    except Exception as exc:
+        await message.answer(
+            f"Не удалось сохранить изображение: {type(exc).__name__}: {str(exc)[:250]}"
+        )
+
 
 
 @router.message(Command("order"))
