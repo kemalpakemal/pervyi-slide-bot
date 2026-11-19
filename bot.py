@@ -672,21 +672,32 @@ async def review_order(message: Message):
     if message.from_user.id != settings.admin_id:
         return
     parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or len(parts[1].strip()) < 8:
-        await message.answer("Укажи начало ID заявки. Например: /review 2c19e81f")
-        return
-    prefix = parts[1].strip()
+    prefix = parts[1].strip() if len(parts) > 1 else ""
     async with Session() as db:
-        matches = list((await db.scalars(
-            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
-        )).all())
-    if not matches:
-        await message.answer("Заявка с таким ID не найдена.")
-        return
-    if len(matches) > 1:
-        await message.answer("Нашлось несколько заявок. Укажи больше символов ID.")
-        return
-    order = matches[0]
+        if prefix:
+            if len(prefix) < 8:
+                await message.answer("Для поиска заявки укажи минимум 8 символов ID.")
+                return
+            matches = list((await db.scalars(
+                select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
+            )).all())
+            if not matches:
+                await message.answer("Заявка с таким ID не найдена.")
+                return
+            if len(matches) > 1:
+                await message.answer("Найдено несколько заявок. Укажи больше символов ID.")
+                return
+            order = matches[0]
+        else:
+            order = await db.scalar(
+                select(Order)
+                .where(Order.status == "admin_review")
+                .order_by(Order.created_at.desc())
+                .limit(1)
+            )
+            if order is None:
+                await message.answer("Нет заявок, ожидающих проверки.")
+                return
     if order.status != "admin_review":
         await message.answer(f"Заявка {order.id[:8]} уже не ожидает проверки. Текущий статус: {order.status}")
         return
@@ -881,6 +892,13 @@ async def generate_from_order_button(call: CallbackQuery):
         await call.answer("Только администратор может запускать генерацию.", show_alert=True)
         return
     order_id = call.data.split(":", 1)[1]
+    if not settings.openai_api_key:
+        await call.answer("Не задан OPENAI_API_KEY. Кнопка останется доступной.", show_alert=True)
+        await call.message.answer(
+            "Чтобы запустить генерацию, сначала добавь OPENAI_API_KEY в Railway → Variables. "
+            "После этого нажми «Сгенерировать демо» ещё раз."
+        )
+        return
     async with Session() as db:
         order = await db.get(Order, order_id)
         if order is None:
