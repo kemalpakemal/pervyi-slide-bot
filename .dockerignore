@@ -1,6 +1,17 @@
 .git
+.gitignore
 .env
+.env.*
+!.env.example
 .venv
 __pycache__
+*.pyc
 .pytest_cache
+.agent-sessions
+.cursor
 data
+*.db
+tests
+pytest.ini
+requirements-dev.txt
+README.md
