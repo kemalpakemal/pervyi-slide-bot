@@ -1,6 +1,7 @@
 import asyncio
 import enum
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,12 +15,21 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove, FSInputFile,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from image_pipeline import (
+    ImagePipelineError,
+    YandexImageProvider,
+    build_background_prompt,
+    compose_slide,
+    cutout_product,
+    make_watermarked_demo,
+)
 
 
 class Settings(BaseSettings):
@@ -29,6 +39,17 @@ class Settings(BaseSettings):
     storage_path: Path = Path("./data")
     max_file_mb: int = 15
     max_files_per_order: int = 12
+    image_provider: str = "yandex_art"
+    yandex_api_key: str | None = None
+    yandex_folder_id: str | None = None
+    yandex_image_model: str = "aliceai-image-art-3.0"
+    yandex_image_size: str = "1024x1536"
+    remove_bg_model: str = "u2netp"
+    output_width: int = 1200
+    output_height: int = 1600
+    demo_long_edge: int = 700
+    demo_watermark_text: str = "ПЕРВЫЙ СЛАЙД • ДЕМО"
+    max_generation_slides: int = 10
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
