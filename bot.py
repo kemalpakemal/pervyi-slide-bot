@@ -433,15 +433,148 @@ async def confirm_brief(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text(f"Бриф принят. Номер заявки: {order_id[:8]}. Администратор проверит материалы и свяжется с тобой.")
     await call.answer()
-    await call.bot.send_message(settings.admin_id, f"Новая заявка {order_id}\nКлиент: @{call.from_user.username or 'без username'} ({call.from_user.id})\n\n{data.get('summary', '')}")
-    for item in data.get("files", []):
+    await send_order_card(call.bot, settings.admin_id, order_id)
+
+
+
+
+@router.callback_query(F.data.startswith("order:"))
+async def process_order_action(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != settings.admin_id:
+        await call.answer("Это действие доступно только администратору.", show_alert=True)
+        return
+
+    try:
+        _, action, order_id = call.data.split(":", 2)
+    except (AttributeError, ValueError):
+        await call.answer("Некорректная команда.", show_alert=True)
+        return
+
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None:
+            await call.answer("Заявка не найдена.", show_alert=True)
+            return
+        if order.status != "admin_review":
+            await call.answer(f"Заявка уже обработана. Статус: {order.status}", show_alert=True)
+            return
+        client = await db.get(Client, order.client_id)
+        client_telegram_id = client.telegram_id if client else None
+
+        if action == "accept":
+            order.status = "accepted"
+            await db.commit()
+        elif action == "reject":
+            order.status = "rejected"
+            await db.commit()
+        elif action == "clarify":
+            await state.clear()
+            await state.update_data(order_id=order_id)
+            await state.set_state(AdminAction.clarification)
+        else:
+            await call.answer("Неизвестное действие.", show_alert=True)
+            return
+
+    if action == "clarify":
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.message.answer(
+            f"Заявка {order_id[:8]}. Напиши одним сообщением, что нужно уточнить у клиента."
+        )
+        await call.answer("Жду текст уточнения.")
+        return
+
+    await call.message.edit_reply_markup(reply_markup=None)
+    if action == "accept":
+        client_message = (
+            f"Заявка №{order_id[:8]} принята администратором. "
+            "Сейчас проверяются материалы и условия заказа. "
+            "Стоимость и сроки будут отдельно согласованы. Пока ничего оплачивать не нужно."
+        )
+        await call.answer("Заявка принята.")
+    else:
+        client_message = (
+            f"К сожалению, студия пока не может принять заявку №{order_id[:8]}. "
+            "По дополнительным вопросам можно написать через кнопку «Связаться с автором»."
+        )
+        await call.answer("Заявка отклонена.")
+
+    if client_telegram_id:
         try:
-            if item["type"] == "photo":
-                await call.bot.send_photo(settings.admin_id, item["file_id"])
-            else:
-                await call.bot.send_document(settings.admin_id, item["file_id"])
+            await call.bot.send_message(client_telegram_id, client_message)
         except Exception:
-            pass
+            await call.message.answer(
+                "Статус обновлён, но сообщение клиенту не доставлено. "
+                "Возможно, клиент ещё не открывал диалог с ботом."
+            )
+
+
+@router.message(AdminAction.clarification)
+async def send_clarification_to_client(message: Message, state: FSMContext):
+    if message.from_user.id != settings.admin_id:
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Нужно отправить текстовое сообщение. Напиши уточнение одним сообщением.")
+        return
+
+    data = await state.get_data()
+    order_id = data.get("order_id")
+    if not order_id:
+        await state.clear()
+        await message.answer("Не найден номер заявки. Открой заявку командой /review и повтори действие.")
+        return
+
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None or order.status != "admin_review":
+            await state.clear()
+            await message.answer("Заявка уже изменила статус. Обнови список через /orders.")
+            return
+        client = await db.get(Client, order.client_id)
+        client_telegram_id = client.telegram_id if client else None
+        order.status = "waiting_client_info"
+        previous = order.assistant_notes or ""
+        order.assistant_notes = (previous + "\\n" if previous else "") + f"Уточнение от студии: {text}"
+        await db.commit()
+
+    await state.clear()
+    if client_telegram_id:
+        try:
+            await message.bot.send_message(
+                client_telegram_id,
+                f"По заявке №{order_id[:8]} нужно уточнение:\\n\\n{text}\\n\\n"
+                "Ответь следующим сообщением в этом чате — я передам ответ администратору."
+            )
+            await message.answer("Уточнение отправлено клиенту. Жду его ответ.")
+        except Exception:
+            await message.answer("Статус заявки сохранён, но Telegram не доставил сообщение клиенту.")
+    else:
+        await message.answer("У заявки не найден Telegram ID клиента.")
+
+
+@router.message(F.text)
+async def forward_client_clarification(message: Message):
+    # Перехватываем обычный текст только когда от этого клиента действительно ждут уточнение.
+    async with Session() as db:
+        client = await db.scalar(select(Client).where(Client.telegram_id == message.from_user.id))
+        if client is None:
+            return
+        order = await db.scalar(
+            select(Order)
+            .where(Order.client_id == client.id, Order.status == "waiting_client_info")
+            .order_by(Order.created_at.desc())
+            .limit(1)
+        )
+        if order is None:
+            return
+        order_id = order.id
+        previous = order.assistant_notes or ""
+        order.assistant_notes = previous + f"\\nОтвет клиента: {message.text[:3000]}"
+        order.status = "admin_review"
+        await db.commit()
+
+    await message.answer(f"Ответ по заявке №{order_id[:8]} передан администратору.")
+    await send_order_card(message.bot, settings.admin_id, order_id)
 
 
 @router.callback_query(F.data == "brief:restart")
