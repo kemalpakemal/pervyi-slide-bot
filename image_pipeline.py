@@ -76,17 +76,38 @@ class OctavApiImageProvider:
             ) as client:
                 response = await client.post(url, headers=headers, json=payload)
                 if response.is_error:
+                    request_id = (
+                        response.headers.get("x-gateway-request-id")
+                        or response.headers.get("x-request-id")
+                        or response.headers.get("request-id")
+                        or "not-provided"
+                    )
+                    retry_after = response.headers.get("retry-after") or "not-provided"
                     try:
                         parsed_error = response.json()
-                        detail = (
-                            parsed_error.get("error", {}).get("message")
-                            if isinstance(parsed_error.get("error"), dict)
-                            else parsed_error.get("error")
-                        ) or parsed_error.get("message") or response.text[:900]
+                        error_value = parsed_error.get("error") if isinstance(parsed_error, dict) else None
+                        if isinstance(error_value, dict):
+                            detail = error_value.get("message") or error_value.get("code") or str(error_value)
+                            error_code = error_value.get("code")
+                        else:
+                            detail = error_value or parsed_error.get("message") or parsed_error.get("detail") or response.text[:900]
+                            error_code = parsed_error.get("code") if isinstance(parsed_error, dict) else None
                     except (ValueError, AttributeError):
                         detail = response.text[:900]
+                        error_code = None
+
+                    # Redact accidental credentials and avoid logging the user prompt.
+                    detail = str(detail).replace(self.api_key, "[REDACTED]")
+                    detail = re.sub(
+                        r"Bearer\\s+[^\\s\"'>;,]+",
+                        "Bearer [REDACTED]",
+                        detail,
+                        flags=re.IGNORECASE,
+                    )[:700]
+                    code_text = f"; provider_code={error_code}" if error_code else ""
                     raise ImagePipelineError(
-                        f"OctavApi Images: HTTP {response.status_code}: {detail}"
+                        f"OctavApi Images: HTTP {response.status_code}{code_text}; "
+                        f"Request-ID={request_id}; Retry-After={retry_after}; {detail}"
                     )
                 body = response.json()
 
