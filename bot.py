@@ -14,7 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, Message, ReplyKeyboardMarkup,
+    KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, delete, select
@@ -237,7 +237,10 @@ async def platform_step(message: Message, state: FSMContext):
         return
     await state.update_data(platform=message.text)
     await state.set_state(Brief.product)
-    await message.answer("Что за товар? Укажи название, модель и разновидность.")
+    await message.answer(
+        "Что за товар? Укажи название, модель и разновидность.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @router.message(Brief.product)
