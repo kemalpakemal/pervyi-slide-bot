@@ -229,6 +229,12 @@ def order_action_menu(order_id: str):
     ])
 
 
+def generate_order_menu(order_id: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сгенерировать демо", callback_data=f"order:generate:{order_id}")]
+    ])
+
+
 async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
     async with Session() as db:
         order = await db.get(Order, order_id)
@@ -513,9 +519,9 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
             "Стоимость и сроки будут отдельно согласованы. Пока ничего оплачивать не нужно."
         )
         await call.answer("Заявка принята.")
-        await call.bot.send_message(
-            settings.admin_id,
-            f"Следующий шаг для заявки {order_id[:8]}: запусти /generate {order_id[:8]}."
+        await call.message.answer(
+            f"Заявка {order_id[:8]} принята. Для запуска генерации нажми кнопку ниже.",
+            reply_markup=generate_order_menu(order_id),
         )
     else:
         client_message = (
@@ -705,48 +711,31 @@ def parse_benefits(value) -> list[str]:
     return [item for item in items if item][:5]
 
 
-@router.message(Command("generate"))
-async def generate_order_design(message: Message):
-    if message.from_user.id != settings.admin_id:
-        return
-
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or len(parts[1].strip()) < 8:
-        await message.answer("Укажи ID заявки. Пример: /generate 2c19e81f")
-        return
-
+async def generate_order_for_admin(bot: Bot, admin_chat_id: int, order_id: str):
+    """Generate demo images for a previously accepted order."""
     if settings.image_provider.lower() != "openai":
-        await message.answer("Провайдер генерации не настроен на OpenAI. Обратись к администратору.")
+        await bot.send_message(admin_chat_id, "Провайдер генерации не настроен на OpenAI.")
         return
+
     if not settings.openai_api_key:
-        await message.answer(
-            "GPT Image 2.6 подключён в коде, но отсутствует OPENAI_API_KEY. "
-            "Добавь ключ в Railway → pervyi-slide-bot → Variables. "
-            "Не отправляй ключ в Telegram или чат."
+        await bot.send_message(
+            admin_chat_id,
+            "Не задан OPENAI_API_KEY. Добавь API-ключ в Railway → pervyi-slide-bot → Variables. "
+            "Пока генерация не запустится."
         )
         return
 
-    prefix = parts[1].strip()
     async with Session() as db:
-        matches = list((await db.scalars(
-            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
-        )).all())
-        if not matches:
-            await message.answer("Заявка с таким ID не найдена.")
+        order = await db.get(Order, order_id)
+        if order is None:
+            await bot.send_message(admin_chat_id, "Заявка не найдена.")
             return
-        if len(matches) > 1:
-            await message.answer("Нашлось несколько заявок. Укажи больше символов ID.")
-            return
-        order = matches[0]
         if order.status not in {"accepted", "demo_review", "demo_sent"}:
-            await message.answer(
-                f"Сначала прими заявку. Сейчас её статус: {order.status}."
-            )
+            await bot.send_message(admin_chat_id, f"Заявка {order_id[:8]} не готова к генерации. Статус: {order.status}.")
             return
         attachments = list((await db.scalars(
             select(OrderFile).where(OrderFile.order_id == order.id).order_by(OrderFile.id)
         )).all())
-        order_id = order.id
         brief = dict(order.brief or {})
         order.status = "generating"
         await db.commit()
@@ -761,13 +750,13 @@ async def generate_order_design(message: Message):
             if order:
                 order.status = "accepted"
                 await db.commit()
-        await message.answer("В заявке нет фото товара. Попроси клиента прислать изображение и добавь его в заказ.")
+        await bot.send_message(admin_chat_id, "В заявке нет фото товара. Попроси клиента прислать изображение.")
         return
 
     order_dir = settings.storage_path / "orders" / order_id
     order_dir.mkdir(parents=True, exist_ok=True)
     try:
-        telegram_file = await message.bot.get_file(product_file.telegram_file_id)
+        telegram_file = await bot.get_file(product_file.telegram_file_id)
         original_ext = Path(telegram_file.file_path or "").suffix.lower()
         if original_ext not in {".jpg", ".jpeg", ".png", ".webp"}:
             original_ext = Path(product_file.original_name or "").suffix.lower()
@@ -775,10 +764,17 @@ async def generate_order_design(message: Message):
             original_ext = ".jpg"
 
         original_path = order_dir / f"product_original{original_ext}"
-        await message.bot.download_file(telegram_file.file_path, destination=original_path)
+        await bot.download_file(telegram_file.file_path, destination=original_path)
 
-        await message.answer(
-            f"Начинаю подготовку заявки {order_id[:8]}: вырезаю товар и генерирую {min(max(int(brief.get('slides', 1)), 1), settings.max_generation_slides)} фон(а/ов)."
+        try:
+            slide_count = int(brief.get("slides", 1))
+        except (TypeError, ValueError):
+            slide_count = 1
+        slide_count = min(max(slide_count, 1), settings.max_generation_slides)
+
+        await bot.send_message(
+            admin_chat_id,
+            f"Генерирую демо по заявке {order_id[:8]}: {slide_count} слайда(ов)."
         )
 
         cutout_path = order_dir / "product_cutout.png"
@@ -793,12 +789,6 @@ async def generate_order_design(message: Message):
             quality=settings.openai_image_quality,
             complexity=settings.openai_image_complexity,
         )
-
-        try:
-            slide_count = int(brief.get("slides", 1))
-        except (TypeError, ValueError):
-            slide_count = 1
-        slide_count = min(max(slide_count, 1), settings.max_generation_slides)
 
         product_name = str(brief.get("product") or "Товар")
         style = str(brief.get("style") or "современный минимализм")
@@ -854,13 +844,14 @@ async def generate_order_design(message: Message):
             await db.commit()
 
         for asset in generated_assets:
-            await message.answer_photo(
+            await bot.send_photo(
+                admin_chat_id,
                 FSInputFile(asset["demo_path"]),
-                caption=f"Заявка {order_id[:8]} · демо слайд {asset['slide']}",
+                caption=f"Заявка {order_id[:8]} · демо-слайд {asset['slide']}",
             )
-        await message.answer(
-            f"Генерация завершена: {slide_count} слайд(а/ов). "
-            "Проверь качество и отправь клиенту только водяные демо-копии.",
+        await bot.send_message(
+            admin_chat_id,
+            f"Демо по заявке {order_id[:8]} готово. Проверь и отправь клиенту только после проверки.",
             reply_markup=design_review_menu(order_id),
         )
 
@@ -870,17 +861,80 @@ async def generate_order_design(message: Message):
             if order and order.status == "generating":
                 order.status = "accepted"
                 await db.commit()
-        await message.answer(f"Генерация остановлена: {exc}")
+        await bot.send_message(admin_chat_id, f"Генерация остановлена: {exc}")
     except Exception as exc:
         async with Session() as db:
             order = await db.get(Order, order_id)
             if order and order.status == "generating":
                 order.status = "accepted"
                 await db.commit()
-        await message.answer(
+        await bot.send_message(
+            admin_chat_id,
             "Не удалось завершить генерацию. Заявка сохранена, статус возвращён на «Принята». "
-            f"Техническая ошибка: {type(exc).__name__}: {str(exc)[:350]}"
+            f"Ошибка: {type(exc).__name__}: {str(exc)[:350]}"
         )
+
+
+@router.callback_query(F.data.startswith("order:generate:"))
+async def generate_from_order_button(call: CallbackQuery):
+    if call.from_user.id != settings.admin_id:
+        await call.answer("Только администратор может запускать генерацию.", show_alert=True)
+        return
+    order_id = call.data.split(":", 2)[2]
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None:
+            await call.answer("Заявка не найдена.", show_alert=True)
+            return
+        if order.status != "accepted":
+            await call.answer(f"Заявка сейчас в статусе {order.status}.", show_alert=True)
+            return
+        order.status = "generation_queued"
+        await db.commit()
+
+    await call.answer("Генерация запущена.")
+    await call.message.edit_reply_markup(reply_markup=None)
+    await generate_order_for_admin(call.bot, call.message.chat.id, order_id)
+
+
+@router.message(Command("generate"))
+async def generate_order_design(message: Message):
+    if message.from_user.id != settings.admin_id:
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    prefix = parts[1].strip() if len(parts) > 1 else ""
+
+    async with Session() as db:
+        if prefix:
+            if len(prefix) < 8:
+                await message.answer("Для поиска заявки укажи минимум 8 символов ID.")
+                return
+            matches = list((await db.scalars(
+                select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
+            )).all())
+            if not matches:
+                await message.answer("Заявка с таким ID не найдена.")
+                return
+            if len(matches) > 1:
+                await message.answer("Найдено несколько заявок. Укажи больше символов ID.")
+                return
+            order = matches[0]
+        else:
+            order = await db.scalar(
+                select(Order)
+                .where(Order.status == "accepted")
+                .order_by(Order.created_at.desc())
+                .limit(1)
+            )
+            if order is None:
+                await message.answer(
+                    "Нет принятых заявок для генерации. Сначала прими заявку из уведомления."
+                )
+                return
+        order_id = order.id
+
+    await generate_order_for_admin(message.bot, message.chat.id, order_id)
 
 
 @router.callback_query(F.data.startswith("design:"))
