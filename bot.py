@@ -682,6 +682,279 @@ async def review_order(message: Message):
     await send_order_card(message.bot, message.chat.id, order.id)
 
 
+
+
+def design_review_menu(order_id: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Отправить демо клиенту", callback_data=f"design:send:{order_id}")],
+        [InlineKeyboardButton(text="Перегенерировать", callback_data=f"design:again:{order_id}")],
+    ])
+
+
+def parse_benefits(value) -> list[str]:
+    if isinstance(value, list):
+        source = "\n".join(str(item) for item in value)
+    else:
+        source = str(value or "")
+    items = [item.strip(" \t\r•-") for item in re.split(r"[\n;,]+", source)]
+    return [item for item in items if item][:5]
+
+
+@router.message(Command("generate"))
+async def generate_order_design(message: Message):
+    if message.from_user.id != settings.admin_id:
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or len(parts[1].strip()) < 8:
+        await message.answer("Укажи ID заявки. Пример: /generate 2c19e81f")
+        return
+
+    if settings.image_provider.lower() != "yandex_art":
+        await message.answer("Сейчас настроен неподдерживаемый IMAGE_PROVIDER. Для генерации выбран Yandex AI Studio.")
+        return
+    if not settings.yandex_api_key or not settings.yandex_folder_id:
+        await message.answer(
+            "Генератор собран, но для запуска не хватает двух секретов Yandex AI Studio:\n"
+            "1. YANDEX_API_KEY\n2. YANDEX_FOLDER_ID\n\n"
+            "Добавь их в Railway → pervyi-slide-bot → Variables. "
+            "Не присылай API-ключ в чат."
+        )
+        return
+
+    prefix = parts[1].strip()
+    async with Session() as db:
+        matches = list((await db.scalars(
+            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
+        )).all())
+        if not matches:
+            await message.answer("Заявка с таким ID не найдена.")
+            return
+        if len(matches) > 1:
+            await message.answer("Нашлось несколько заявок. Укажи больше символов ID.")
+            return
+        order = matches[0]
+        if order.status not in {"accepted", "demo_review", "demo_sent"}:
+            await message.answer(
+                f"Сначала прими заявку. Сейчас её статус: {order.status}."
+            )
+            return
+        attachments = list((await db.scalars(
+            select(OrderFile).where(OrderFile.order_id == order.id).order_by(OrderFile.id)
+        )).all())
+        order_id = order.id
+        brief = dict(order.brief or {})
+        order.status = "generating"
+        await db.commit()
+
+    product_file = next(
+        (item for item in attachments if item.file_type in {"photo", "document"}),
+        None,
+    )
+    if product_file is None:
+        async with Session() as db:
+            order = await db.get(Order, order_id)
+            if order:
+                order.status = "accepted"
+                await db.commit()
+        await message.answer("В заявке нет фото товара. Попроси клиента прислать изображение и добавь его в заказ.")
+        return
+
+    order_dir = settings.storage_path / "orders" / order_id
+    order_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        telegram_file = await message.bot.get_file(product_file.telegram_file_id)
+        original_ext = Path(telegram_file.file_path or "").suffix.lower()
+        if original_ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+            original_ext = Path(product_file.original_name or "").suffix.lower()
+        if original_ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+            original_ext = ".jpg"
+
+        original_path = order_dir / f"product_original{original_ext}"
+        await message.bot.download_file(telegram_file.file_path, destination=original_path)
+
+        await message.answer(
+            f"Начинаю подготовку заявки {order_id[:8]}: вырезаю товар и генерирую {min(max(int(brief.get('slides', 1)), 1), settings.max_generation_slides)} фон(а/ов)."
+        )
+
+        cutout_path = order_dir / "product_cutout.png"
+        await asyncio.to_thread(
+            cutout_product, original_path, cutout_path, settings.remove_bg_model
+        )
+
+        provider = YandexImageProvider(
+            api_key=settings.yandex_api_key,
+            folder_id=settings.yandex_folder_id,
+            model=settings.yandex_image_model,
+            size=settings.yandex_image_size,
+        )
+
+        try:
+            slide_count = int(brief.get("slides", 1))
+        except (TypeError, ValueError):
+            slide_count = 1
+        slide_count = min(max(slide_count, 1), settings.max_generation_slides)
+
+        product_name = str(brief.get("product") or "Товар")
+        style = str(brief.get("style") or "современный минимализм")
+        colors = str(brief.get("colors") or "нейтральные цвета")
+        benefits = parse_benefits(brief.get("advantages"))
+        generated_assets = []
+
+        for slide_number in range(1, slide_count + 1):
+            background_path = order_dir / f"background_{slide_number:02d}.jpg"
+            final_path = order_dir / f"final_{slide_number:02d}.png"
+            demo_path = order_dir / f"demo_{slide_number:02d}.jpg"
+
+            prompt = build_background_prompt(
+                product_name, style, colors, slide_number
+            )
+            await provider.generate(prompt, background_path)
+
+            await asyncio.to_thread(
+                compose_slide,
+                background_path,
+                cutout_path,
+                final_path,
+                product_name,
+                benefits,
+                slide_number,
+                settings.output_width,
+                settings.output_height,
+            )
+            await asyncio.to_thread(
+                make_watermarked_demo,
+                final_path,
+                demo_path,
+                settings.demo_long_edge,
+                settings.demo_watermark_text,
+            )
+            generated_assets.append({
+                "slide": slide_number,
+                "final_path": str(final_path),
+                "demo_path": str(demo_path),
+            })
+
+        async with Session() as db:
+            order = await db.get(Order, order_id)
+            if order is None:
+                raise ImagePipelineError("Заявка была удалена во время генерации.")
+            updated_brief = dict(order.brief or {})
+            updated_brief["design_assets"] = generated_assets
+            order.brief = updated_brief
+            order.status = "demo_review"
+            await db.commit()
+
+        for asset in generated_assets:
+            await message.answer_photo(
+                FSInputFile(asset["demo_path"]),
+                caption=f"Заявка {order_id[:8]} · демо слайд {asset['slide']}",
+            )
+        await message.answer(
+            f"Генерация завершена: {slide_count} слайд(а/ов). "
+            "Проверь качество и отправь клиенту только водяные демо-копии.",
+            reply_markup=design_review_menu(order_id),
+        )
+
+    except ImagePipelineError as exc:
+        async with Session() as db:
+            order = await db.get(Order, order_id)
+            if order and order.status == "generating":
+                order.status = "accepted"
+                await db.commit()
+        await message.answer(f"Генерация остановлена: {exc}")
+    except Exception as exc:
+        async with Session() as db:
+            order = await db.get(Order, order_id)
+            if order and order.status == "generating":
+                order.status = "accepted"
+                await db.commit()
+        await message.answer(
+            "Не удалось завершить генерацию. Заявка сохранена, статус возвращён на «Принята». "
+            f"Техническая ошибка: {type(exc).__name__}: {str(exc)[:350]}"
+        )
+
+
+@router.callback_query(F.data.startswith("design:"))
+async def process_design_action(call: CallbackQuery):
+    if call.from_user.id != settings.admin_id:
+        await call.answer("Это действие доступно только администратору.", show_alert=True)
+        return
+
+    try:
+        _, action, order_id = call.data.split(":", 2)
+    except (AttributeError, ValueError):
+        await call.answer("Некорректное действие.", show_alert=True)
+        return
+
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None:
+            await call.answer("Заявка не найдена.", show_alert=True)
+            return
+        brief = dict(order.brief or {})
+        assets = brief.get("design_assets", [])
+
+        if action == "again":
+            if order.status != "demo_review":
+                await call.answer(f"Нельзя перегенерировать в статусе {order.status}.", show_alert=True)
+                return
+            brief.pop("design_assets", None)
+            order.brief = brief
+            order.status = "accepted"
+            await db.commit()
+            await call.message.edit_reply_markup(reply_markup=None)
+            await call.message.answer(f"Готово. Запусти новую генерацию: /generate {order_id[:8]}")
+            await call.answer("Заявка готова к повторной генерации.")
+            return
+
+        if action != "send":
+            await call.answer("Неизвестное действие.", show_alert=True)
+            return
+        if order.status != "demo_review" or not assets:
+            await call.answer("Демо ещё не подготовлено или уже отправлено.", show_alert=True)
+            return
+        client = await db.get(Client, order.client_id)
+        client_telegram_id = client.telegram_id if client else None
+
+    if not client_telegram_id:
+        await call.answer("Не найден Telegram ID клиента.", show_alert=True)
+        return
+
+    try:
+        await call.bot.send_message(
+            client_telegram_id,
+            f"Готово демо по заявке №{order_id[:8]}. Это предварительные изображения с водяным знаком. "
+            "Посмотри их и напиши, что нужно поправить. Чистые оригиналы выдаются после согласования и оплаты."
+        )
+        for asset in assets:
+            demo_path = Path(asset.get("demo_path", ""))
+            if not demo_path.is_file():
+                raise ImagePipelineError(f"Не найден демо-файл слайда {asset.get('slide')}.")
+            await call.bot.send_photo(
+                client_telegram_id,
+                FSInputFile(demo_path),
+                caption=f"Демо · слайд {asset.get('slide')}",
+            )
+    except Exception as exc:
+        await call.message.answer(
+            "Не получилось отправить демо клиенту. Проверь, что он не заблокировал бота. "
+            f"Ошибка: {type(exc).__name__}."
+        )
+        await call.answer("Отправка не удалась.", show_alert=True)
+        return
+
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order and order.status == "demo_review":
+            order.status = "demo_sent"
+            await db.commit()
+
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("Демо отправлено клиенту.")
+    await call.message.answer(f"Демо по заявке {order_id[:8]} отправлено. Оригиналы остаются в закрытом хранилище.")
+
+
 @router.message(Command("order"))
 async def create_assistant_order(message: Message):
     if message.from_user.id != settings.admin_id:
