@@ -552,31 +552,6 @@ async def send_clarification_to_client(message: Message, state: FSMContext):
         await message.answer("У заявки не найден Telegram ID клиента.")
 
 
-@router.message(F.text)
-async def forward_client_clarification(message: Message):
-    # Перехватываем обычный текст только когда от этого клиента действительно ждут уточнение.
-    async with Session() as db:
-        client = await db.scalar(select(Client).where(Client.telegram_id == message.from_user.id))
-        if client is None:
-            return
-        order = await db.scalar(
-            select(Order)
-            .where(Order.client_id == client.id, Order.status == "waiting_client_info")
-            .order_by(Order.created_at.desc())
-            .limit(1)
-        )
-        if order is None:
-            return
-        order_id = order.id
-        previous = order.assistant_notes or ""
-        order.assistant_notes = previous + f"\\nОтвет клиента: {message.text[:3000]}"
-        order.status = "admin_review"
-        await db.commit()
-
-    await message.answer(f"Ответ по заявке №{order_id[:8]} передан администратору.")
-    await send_order_card(message.bot, settings.admin_id, order_id)
-
-
 @router.callback_query(F.data == "brief:restart")
 async def restart_brief(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -658,6 +633,32 @@ async def orders(message: Message):
         await message.answer("Заказов пока нет.")
         return
     await message.answer("Последние заказы:\n" + "\n".join(f"{x.id[:8]} · {x.status} · {x.source}" for x in rows))
+
+
+@router.message(Command("review"))
+async def review_order(message: Message):
+    if message.from_user.id != settings.admin_id:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or len(parts[1].strip()) < 8:
+        await message.answer("Укажи начало ID заявки. Например: /review 2c19e81f")
+        return
+    prefix = parts[1].strip()
+    async with Session() as db:
+        matches = list((await db.scalars(
+            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
+        )).all())
+    if not matches:
+        await message.answer("Заявка с таким ID не найдена.")
+        return
+    if len(matches) > 1:
+        await message.answer("Нашлось несколько заявок. Укажи больше символов ID.")
+        return
+    order = matches[0]
+    if order.status != "admin_review":
+        await message.answer(f"Заявка {order.id[:8]} уже не ожидает проверки. Текущий статус: {order.status}")
+        return
+    await send_order_card(message.bot, message.chat.id, order.id)
 
 
 @router.message(Command("order"))
@@ -761,6 +762,31 @@ async def forget(message: Message):
             await db.delete(client)
             await db.commit()
     await message.answer("Данные профиля и заявки удалены из базы. Telegram-вложения физически не копируются в хранилище на этом этапе.")
+
+
+@router.message(F.text)
+async def forward_client_clarification(message: Message):
+    # Перехватываем обычный текст только когда от этого клиента действительно ждут уточнение.
+    async with Session() as db:
+        client = await db.scalar(select(Client).where(Client.telegram_id == message.from_user.id))
+        if client is None:
+            return
+        order = await db.scalar(
+            select(Order)
+            .where(Order.client_id == client.id, Order.status == "waiting_client_info")
+            .order_by(Order.created_at.desc())
+            .limit(1)
+        )
+        if order is None:
+            return
+        order_id = order.id
+        previous = order.assistant_notes or ""
+        order.assistant_notes = previous + f"\\nОтвет клиента: {message.text[:3000]}"
+        order.status = "admin_review"
+        await db.commit()
+
+    await message.answer(f"Ответ по заявке №{order_id[:8]} передан администратору.")
+    await send_order_card(message.bot, settings.admin_id, order_id)
 
 
 async def main():
