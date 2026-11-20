@@ -717,297 +717,579 @@ async def review_order(message: Message):
 
 
 
-def design_upload_menu(order_id: str):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Загрузить изображения из ChatGPT", callback_data=f"design:upload:{order_id}")]
-    ])
-
-
-def design_review_menu(order_id: str):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Добавить следующий слайд", callback_data=f"design:upload:{order_id}")],
-        [InlineKeyboardButton(text="Отправить демо клиенту", callback_data=f"design:send:{order_id}")],
-    ])
-
 
 def parse_benefits(value) -> list[str]:
-    if isinstance(value, list):
-        source = "\n".join(str(item) for item in value)
-    else:
-        source = str(value or "")
+    source = "\n".join(str(x) for x in value) if isinstance(value, list) else str(value or "")
     items = [item.strip(" \t\r•-") for item in re.split(r"[\n;,]+", source)]
     return [item for item in items if item][:5]
 
 
+def design_review_menu(order_id: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Отправить демо клиенту", callback_data=f"design:send:{order_id}")]
+    ])
+
+
+def manual_generation_menu(order_id: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Повторить генерацию", callback_data=f"design:retry:{order_id}")],
+        [InlineKeyboardButton(text="Продолжить вручную", callback_data=f"design:manual:{order_id}")],
+    ])
+
+
+def _slide_total(brief: dict) -> int:
+    try:
+        requested = int(brief.get("slides") or 1)
+    except (TypeError, ValueError):
+        requested = 1
+    return max(1, min(requested, settings.max_generation_slides))
+
+
+def _pending_slots(assets: list[dict], total_slides: int) -> list[dict]:
+    existing = set()
+    for item in assets:
+        try:
+            slide = int(item.get("slide", 0))
+            variant = int(item.get("variant", 1))
+            if slide and variant:
+                existing.add((slide, variant))
+        except (TypeError, ValueError):
+            continue
+    return [
+        {"slide": slide, "variant": variant}
+        for slide in range(1, total_slides + 1)
+        for variant in (1, 2)
+        if (slide, variant) not in existing
+    ]
+
+
+async def _download_order_inputs(bot: Bot, order_id: str, attachments: list[OrderFile]) -> list[Path]:
+    input_dir = settings.storage_path / "orders" / order_id / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for index, item in enumerate(attachments, start=1):
+        try:
+            telegram_file = await bot.get_file(item.telegram_file_id)
+            ext = Path(telegram_file.file_path or "").suffix.lower()
+            if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+                ext = Path(item.original_name or "").suffix.lower()
+            if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+                ext = ".jpg"
+            path = input_dir / f"input_{index:02d}{ext}"
+            if not path.exists():
+                await bot.download_file(telegram_file.file_path, destination=path)
+            if path.is_file() and path.stat().st_size:
+                paths.append(path)
+        except Exception:
+            continue
+    return paths
+
+
+async def _set_order_status(order_id: str, status: str) -> None:
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order:
+            order.status = status
+            await db.commit()
+
+
+async def _prepare_asset(source_path: Path, final_path: Path, demo_path: Path, brief: dict) -> tuple[Path, Path]:
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    if settings.text_overlay_enabled:
+        await asyncio.to_thread(
+            apply_text_overlay, source_path, final_path,
+            str(brief.get("product") or "")[:80],
+            parse_benefits(brief.get("advantages")),
+        )
+    elif source_path.resolve() != final_path.resolve():
+        await asyncio.to_thread(shutil.copyfile, source_path, final_path)
+    await asyncio.to_thread(
+        make_watermarked_demo, final_path, demo_path,
+        settings.demo_long_edge, settings.demo_watermark_text,
+    )
+    return final_path, demo_path
+
+
+async def _persist_assets(
+    order_id: str,
+    new_assets: list[dict],
+    *,
+    api_call: bool = False,
+    estimated_cost: float = 0.0,
+    clear_pending: bool = False,
+    failed_attempt: bool = False,
+    uncertain_slide: int | None = None,
+) -> dict:
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None:
+            raise ImagePipelineError("Заявка не найдена.")
+        brief = dict(order.brief or {})
+        assets = list(brief.get("design_assets", []))
+        assets.extend(new_assets)
+        brief["design_assets"] = assets
+        metrics = dict(brief.get("generation_metrics", {}))
+        metrics["api_calls"] = int(metrics.get("api_calls", 0)) + (1 if api_call else 0)
+        metrics["images_generated"] = int(metrics.get("images_generated", 0)) + len(new_assets)
+        metrics["estimated_cost_usd"] = round(
+            float(metrics.get("estimated_cost_usd", 0.0)) + float(estimated_cost), 4
+        )
+        metrics["failed_attempts"] = int(metrics.get("failed_attempts", 0)) + (1 if failed_attempt else 0)
+        if uncertain_slide is not None:
+            metrics["uncertain_requests"] = int(metrics.get("uncertain_requests", 0)) + 1
+            blocked = list(brief.get("manual_required_slides", []))
+            if uncertain_slide not in blocked:
+                blocked.append(uncertain_slide)
+            brief["manual_required_slides"] = blocked
+        brief["generation_metrics"] = metrics
+        if clear_pending:
+            brief.pop("generation_pending", None)
+        order.brief = brief
+        await db.commit()
+        return brief
+
+
+async def _send_album(
+    bot: Bot, chat_id: int, paths: list[Path], caption: str = "", *, documents: bool = False
+) -> list[int]:
+    ids: list[int] = []
+    for offset in range(0, len(paths), 10):
+        chunk = paths[offset:offset + 10]
+        if len(chunk) == 1:
+            if documents:
+                sent = await bot.send_document(chat_id, FSInputFile(chunk[0]), caption=caption if offset == 0 else None)
+            else:
+                sent = await bot.send_photo(chat_id, FSInputFile(chunk[0]), caption=caption if offset == 0 else None)
+            ids.append(sent.message_id)
+            continue
+        if documents:
+            media = [
+                InputMediaDocument(media=FSInputFile(path), caption=caption if offset == 0 and i == 0 else None)
+                for i, path in enumerate(chunk)
+            ]
+        else:
+            media = [
+                InputMediaPhoto(media=FSInputFile(path), caption=caption if offset == 0 and i == 0 else None)
+                for i, path in enumerate(chunk)
+            ]
+        sent = await bot.send_media_group(chat_id, media=media)
+        ids.extend(item.message_id for item in sent)
+    return ids
+
+
+async def _send_owner_review(bot: Bot, order_id: str, brief: dict, *, note: str = "Генерация завершена.") -> None:
+    assets = sorted(
+        list(brief.get("design_assets", [])),
+        key=lambda item: (int(item.get("slide", 0)), int(item.get("variant", 0))),
+    )
+    originals = [Path(x["final_path"]) for x in assets if Path(x.get("final_path", "")).is_file()]
+    demos = [Path(x["demo_path"]) for x in assets if Path(x.get("demo_path", "")).is_file()]
+    if originals:
+        await bot.send_message(settings.admin_id, f"Оригиналы без водяного знака · заявка {order_id[:8]}")
+        await _send_album(bot, settings.admin_id, originals, documents=True)
+    if demos:
+        await bot.send_message(settings.admin_id, f"Предпросмотр демо с водяным знаком · заявка {order_id[:8]}")
+        await _send_album(bot, settings.admin_id, demos)
+    metrics = dict(brief.get("generation_metrics", {}))
+    estimated = float(metrics.get("estimated_cost_usd", 0.0))
+    summary = (
+        f"{note}\nЗаявка: {order_id[:8]}\n"
+        f"Подготовлено изображений: {len(originals)}\n"
+        f"Успешных API-вызовов: {int(metrics.get('api_calls', 0))}\n"
+        f"Оценка расходов API: USD {estimated:.2f}\n"
+        f"Ошибочных попыток: {int(metrics.get('failed_attempts', 0))}\n"
+        "Клиенту отправятся только копии с водяным знаком."
+    )
+    await bot.send_message(settings.admin_id, summary, reply_markup=design_review_menu(order_id))
+
+
+async def _send_manual_bundle(
+    bot: Bot,
+    state: FSMContext,
+    order_id: str,
+    brief: dict,
+    attachments: list[OrderFile],
+    input_paths: list[Path],
+    reason: str = "",
+) -> None:
+    total = _slide_total(brief)
+    slots = _pending_slots(list(brief.get("design_assets", [])), total)
+    if not slots:
+        await _set_order_status(order_id, "demo_review")
+        await _send_owner_review(bot, order_id, brief, note="Все варианты уже подготовлены.")
+        return
+    if not input_paths:
+        await _set_order_status(order_id, "manual_pending")
+        await bot.send_message(
+            settings.admin_id,
+            f"Заявка {order_id[:8]}: в заявке нет пригодного фото товара. "
+            "Попроси клиента добавить фото товара, затем открой заявку через /review.",
+            reply_markup=manual_generation_menu(order_id),
+        )
+        return
+
+    prompt = build_product_prompt(brief, int(slots[0]["slide"]), total)
+    sequence = ", ".join(f"слайд {x['slide']} · вариант {x['variant']}" for x in slots)
+    instruction = (
+        f" Подготовь отдельные изображения в этом порядке: {sequence}. "
+        "Первое фото во вложениях — товар, остальные — референсы. Не меняй форму, цвет, упаковку, "
+        "этикетку и текст на товаре. Верни одно изображение на каждый вариант."
+    )
+    caption = (prompt + instruction)[:1024]
+
+    await state.clear()
+    source_ids = await _send_album(bot, settings.admin_id, input_paths[:20], caption=caption, documents=True)
+    await state.update_data(
+        order_id=order_id,
+        source_message_ids=source_ids,
+        slots=slots,
+        received_count=0,
+        brief=brief,
+    )
+    await state.set_state(AdminAction.manual_images)
+    extra = f"\nПричина ручного режима: {reason}" if reason else ""
+    await bot.send_message(
+        settings.admin_id,
+        f"Пакет заявки {order_id[:8]} отправлен альбомом. Загрузи {len(slots)} готовых изображений "
+        "ответом на любой элемент исходного альбома. Лучше отправлять как файлы без сжатия."
+        f"{extra}",
+        reply_markup=manual_generation_menu(order_id),
+    )
+
+
+async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force_manual: bool = False) -> None:
+    async with Session() as db:
+        result = await db.execute(
+            update(Order).where(
+                Order.id == order_id,
+                Order.status.in_(["accepted", "manual_pending"]),
+            ).values(status="generating")
+        )
+        if result.rowcount != 1:
+            order = await db.get(Order, order_id)
+            current = order.status if order else "не найдена"
+            await bot.send_message(settings.admin_id, f"Заявка {order_id[:8]} уже обрабатывается или недоступна. Статус: {current}.")
+            return
+        await db.commit()
+        order = await db.get(Order, order_id)
+        brief = dict(order.brief or {})
+        attachments = list((await db.scalars(
+            select(OrderFile).where(OrderFile.order_id == order_id).order_by(OrderFile.id)
+        )).all())
+
+    total = _slide_total(brief)
+    requested = int(brief.get("slides") or 1)
+    if requested > settings.max_generation_slides:
+        await bot.send_message(
+            settings.admin_id,
+            f"Лимит MAX_GENERATION_SLIDES={settings.max_generation_slides}: "
+            f"будет обработано {settings.max_generation_slides} из {requested} слайдов."
+        )
+    input_paths = await _download_order_inputs(bot, order_id, attachments)
+    if not input_paths:
+        await _set_order_status(order_id, "manual_pending")
+        await bot.send_message(
+            settings.admin_id,
+            f"Заявка {order_id[:8]}: не удалось получить исходные изображения. Генерация не запускалась.",
+            reply_markup=manual_generation_menu(order_id),
+        )
+        return
+
+    use_api = (
+        not force_manual
+        and settings.image_mode.strip().lower() == "auto"
+        and bool(settings.openai_api_key)
+    )
+    if not use_api:
+        await _set_order_status(order_id, "manual_pending")
+        await _send_manual_bundle(bot, state, order_id, brief, attachments, input_paths)
+        return
+
+    metrics = dict(brief.get("generation_metrics", {}))
+    current_cost = float(metrics.get("estimated_cost_usd", 0.0))
+    unit_cost = max(0.0, float(settings.estimated_image_cost_usd))
+    cost_cap = max(0.0, float(settings.max_order_cost_usd))
+    blocked_slides = {int(x) for x in brief.get("manual_required_slides", [])}
+    completed: dict[int, set[int]] = {}
+    for asset in brief.get("design_assets", []):
+        completed.setdefault(int(asset.get("slide", 0)), set()).add(int(asset.get("variant", 1)))
+
+    fallback_reason = ""
+    order_dir = settings.storage_path / "orders" / order_id
+    order_dir.mkdir(parents=True, exist_ok=True)
+    for slide in range(1, total + 1):
+        variants = completed.get(slide, set())
+        if len(variants) >= 2 or variants or slide in blocked_slides:
+            continue
+        reservation = unit_cost * 2
+        if current_cost + reservation > cost_cap:
+            fallback_reason = f"Достигнут лимит стоимости заказа USD {cost_cap:.2f}; оставшиеся слайды переданы в ручной режим."
+            break
+
+        raw_paths = [order_dir / f"slide_{slide:02d}_variant_{v:02d}_raw.png" for v in (1, 2)]
+        final_paths = [order_dir / f"slide_{slide:02d}_variant_{v:02d}.png" for v in (1, 2)]
+        demo_paths = [order_dir / f"slide_{slide:02d}_variant_{v:02d}_demo.jpg" for v in (1, 2)]
+        idem_key = f"pervyi-slide:{order_id}:slide:{slide}:variants:1-2"
+
+        async with Session() as db:
+            order = await db.get(Order, order_id)
+            updated = dict(order.brief or {})
+            updated["generation_pending"] = {
+                "slide": slide,
+                "reserved_cost_usd": reservation,
+                "idempotency_key": idem_key,
+            }
+            order.brief = updated
+            await db.commit()
+
+        try:
+            await generate_two_images(
+                api_key=settings.openai_api_key or "",
+                base_url=settings.openai_base_url,
+                model=settings.openai_image_model,
+                prompt=build_product_prompt(brief, slide, total),
+                image_paths=input_paths,
+                output_paths=raw_paths,
+                idempotency_key=idem_key,
+                timeout_seconds=settings.generation_timeout_seconds,
+                max_attempts=3,
+                size=settings.openai_image_size,
+                quality=settings.openai_image_quality,
+            )
+            new_assets = []
+            for variant, raw_path in enumerate(raw_paths, start=1):
+                await _prepare_asset(raw_path, final_paths[variant - 1], demo_paths[variant - 1], brief)
+                new_assets.append({
+                    "slide": slide,
+                    "variant": variant,
+                    "final_path": str(final_paths[variant - 1]),
+                    "demo_path": str(demo_paths[variant - 1]),
+                    "source": "openai_images",
+                })
+            brief = await _persist_assets(
+                order_id, new_assets, api_call=True,
+                estimated_cost=reservation, clear_pending=True,
+            )
+            current_cost += reservation
+            completed[slide] = {1, 2}
+        except ImageGenerationError as exc:
+            brief = await _persist_assets(
+                order_id, [], clear_pending=True, failed_attempt=True,
+                uncertain_slide=slide if exc.uncertain else None,
+                estimated_cost=reservation if exc.uncertain else 0.0,
+            )
+            if exc.uncertain:
+                current_cost += reservation
+            fallback_reason = str(exc)
+            break
+        except Exception:
+            brief = await _persist_assets(
+                order_id, [], clear_pending=True, failed_attempt=True,
+                uncertain_slide=slide, estimated_cost=reservation,
+            )
+            current_cost += reservation
+            fallback_reason = "Ошибка обработки результата; слайд переведён в ручной режим."
+            break
+
+    missing = _pending_slots(list(brief.get("design_assets", [])), total)
+    if fallback_reason or missing:
+        await _set_order_status(order_id, "manual_pending")
+        await _send_manual_bundle(
+            bot, state, order_id, brief, attachments, input_paths,
+            reason=fallback_reason or "Не все варианты слайдов были созданы автоматически.",
+        )
+        return
+
+    await _set_order_status(order_id, "demo_review")
+    await _send_owner_review(bot, order_id, brief)
+
+
 @router.message(Command("generate"))
-async def generate_order_design(message: Message):
+async def generate_order_design(message: Message, state: FSMContext):
     if message.from_user.id != settings.admin_id:
         return
-    await message.answer(
-        "Автогенерация через OctavApi отключена из-за повторяющейся ошибки 502/5002. "
-        "Создай изображение в ChatGPT, поделись им с @pervy_slide_bot, "
-        "затем ответь на фото командой /demo ID заявки."
-    )
+    parts = (message.text or "").split(maxsplit=1)
+    prefix = parts[1].strip() if len(parts) > 1 else ""
+    async with Session() as db:
+        if prefix:
+            matches = list((await db.scalars(select(Order).where(Order.id.like(f"{prefix}%")).limit(2))).all())
+            if not matches:
+                await message.answer("Заявка не найдена.")
+                return
+            if len(matches) > 1:
+                await message.answer("Найдено несколько заявок. Укажи больше символов ID.")
+                return
+            order_id = matches[0].id
+        else:
+            order = await db.scalar(
+                select(Order).where(Order.status.in_(["accepted", "manual_pending"]))
+                .order_by(Order.created_at.desc()).limit(1)
+            )
+            if order is None:
+                await message.answer("Нет принятых заявок, готовых к генерации.")
+                return
+            order_id = order.id
+    await _begin_generation(message.bot, state, order_id)
 
 
 @router.callback_query(F.data.startswith("design:"))
 async def process_design_action(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != settings.admin_id:
-        await call.answer("Это действие доступно только администратору.", show_alert=True)
+        await call.answer("Только администратор может запускать генерацию и одобрять отправку.", show_alert=True)
         return
-
     try:
         _, action, order_id = call.data.split(":", 2)
     except (AttributeError, ValueError):
         await call.answer("Некорректное действие.", show_alert=True)
         return
 
-    async with Session() as db:
-        order = await db.get(Order, order_id)
-        if order is None:
-            await call.answer("Заявка не найдена.", show_alert=True)
-            return
-        brief = dict(order.brief or {})
-        assets = brief.get("design_assets", [])
-
-        if action == "upload":
-            if order.status not in {"accepted", "demo_review"}:
-                await call.answer(f"Нельзя загрузить слайд в статусе {order.status}.", show_alert=True)
-                return
-            await state.clear()
-            await state.update_data(order_id=order_id)
-            await state.set_state(AdminAction.design_upload)
-            await call.answer()
-            await call.message.answer(
-                f"Заявка {order_id[:8]}. Теперь отправь сюда готовое изображение из ChatGPT "
-                "как фото или файлом JPG, PNG или WEBP. Я сохраню оригинал и подготовлю демо с водяным знаком. "
-                "Клиент ничего не получит, пока ты не нажмёшь «Отправить демо клиенту».\n\n"
-                "Чтобы выйти без загрузки, напиши «Отмена»."
-            )
-            return
-
-        if action == "again":
-            if order.status != "demo_review":
-                await call.answer(f"Нельзя перегенерировать в статусе {order.status}.", show_alert=True)
-                return
-            brief.pop("design_assets", None)
-            order.brief = brief
-            order.status = "accepted"
-            await db.commit()
-            await call.message.edit_reply_markup(reply_markup=None)
-            await call.message.answer(f"Готово. Запусти новую генерацию: /generate {order_id[:8]}")
-            await call.answer("Заявка готова к повторной генерации.")
-            return
-
-        if action != "send":
-            await call.answer("Неизвестное действие.", show_alert=True)
-            return
-        if order.status != "demo_review" or not assets:
-            await call.answer("Демо ещё не подготовлено или уже отправлено.", show_alert=True)
-            return
-        client = await db.get(Client, order.client_id)
-        client_telegram_id = client.telegram_id if client else None
-
-    if not client_telegram_id:
-        await call.answer("Не найден Telegram ID клиента.", show_alert=True)
+    if action in {"create", "retry"}:
+        await call.answer("Запускаю обработку заявки.")
+        await _begin_generation(call.bot, state, order_id)
         return
 
+    if action == "manual":
+        async with Session() as db:
+            order = await db.get(Order, order_id)
+            if order is None or order.status != "manual_pending":
+                await call.answer("Заявка не ожидает ручной обработки.", show_alert=True)
+                return
+            brief = dict(order.brief or {})
+            attachments = list((await db.scalars(
+                select(OrderFile).where(OrderFile.order_id == order_id).order_by(OrderFile.id)
+            )).all())
+        input_paths = await _download_order_inputs(call.bot, order_id, attachments)
+        await call.answer("Готовлю пакет для ручного режима.")
+        await _send_manual_bundle(call.bot, state, order_id, brief, attachments, input_paths)
+        return
+
+    if action != "send":
+        await call.answer("Неизвестное действие.", show_alert=True)
+        return
+
+    async with Session() as db:
+        result = await db.execute(
+            update(Order).where(Order.id == order_id, Order.status == "demo_review").values(status="sending_demo")
+        )
+        if result.rowcount != 1:
+            await call.answer("Демо уже отправляется или заявка не готова.", show_alert=True)
+            return
+        await db.commit()
+        order = await db.get(Order, order_id)
+        brief = dict(order.brief or {})
+        client = await db.get(Client, order.client_id)
+        client_telegram_id = client.telegram_id if client else None
+        assets = sorted(
+            list(brief.get("design_assets", [])),
+            key=lambda item: (int(item.get("slide", 0)), int(item.get("variant", 0))),
+        )
+
+    if not client_telegram_id or not assets:
+        await _set_order_status(order_id, "demo_review")
+        await call.answer("Не найден клиент или отсутствуют готовые демо.", show_alert=True)
+        return
     try:
         await call.bot.send_message(
             client_telegram_id,
-            f"Готово демо по заявке №{order_id[:8]}. Это предварительные изображения с водяным знаком. "
-            "Посмотри их и напиши, что нужно поправить. Чистые оригиналы выдаются после согласования и оплаты."
+            f"Подготовлено демо по заявке №{order_id[:8]}. Это предварительные изображения с водяным знаком. "
+            "Напиши, что нужно поправить. Оригиналы без водяного знака передаются только после согласования и оплаты."
         )
         for asset in assets:
             demo_path = Path(asset.get("demo_path", ""))
             if not demo_path.is_file():
-                raise ImagePipelineError(f"Не найден демо-файл слайда {asset.get('slide')}.")
+                raise ImagePipelineError("Демо-файл отсутствует.")
             await call.bot.send_photo(
-                client_telegram_id,
-                FSInputFile(demo_path),
-                caption=f"Демо · слайд {asset.get('slide')}",
+                client_telegram_id, FSInputFile(demo_path),
+                caption=f"Демо · слайд {asset.get('slide')} · вариант {asset.get('variant')}",
             )
-    except Exception as exc:
-        await call.message.answer(
-            "Не получилось отправить демо клиенту. Проверь, что он не заблокировал бота. "
-            f"Ошибка: {type(exc).__name__}."
-        )
+    except Exception:
+        await _set_order_status(order_id, "demo_review")
+        await call.message.answer("Не удалось доставить демо. Статус сохранён для повторной проверки.")
         await call.answer("Отправка не удалась.", show_alert=True)
         return
 
-    async with Session() as db:
-        order = await db.get(Order, order_id)
-        if order and order.status == "demo_review":
-            order.status = "demo_sent"
-            await db.commit()
-
+    await _set_order_status(order_id, "demo_sent")
     await call.message.edit_reply_markup(reply_markup=None)
     await call.answer("Демо отправлено клиенту.")
-    await call.message.answer(f"Демо по заявке {order_id[:8]} отправлено. Оригиналы остаются в закрытом хранилище.")
+    await call.message.answer(f"Демо по заявке {order_id[:8]} отправлено. Клиент получил только версии с водяным знаком.")
 
 
-
-
-@router.callback_query(F.data.startswith("manual-demo-help:"))
-async def manual_demo_help(call: CallbackQuery):
-    if call.from_user.id != settings.admin_id:
-        await call.answer("Только администратор может использовать эту функцию.", show_alert=True)
+@router.message(AdminAction.manual_images, F.photo | F.document)
+async def receive_manual_variants(message: Message, state: FSMContext):
+    if message.from_user.id != settings.admin_id:
         return
-    order_id = call.data.split(":", 1)[1]
-    await call.answer()
-    await call.message.answer(
-        "Порядок передачи готового изображения из ChatGPT:\n"
-        "1. Создай макет в ChatGPT по брифу и фото товара.\n"
-        "2. Нажми «Поделиться» → Telegram → @pervy_slide_bot.\n"
-        f"3. Ответь на фото командой /demo {order_id[:8]}.\n"
-        "Бот сохранит оригинал, наложит водяной знак и покажет кнопку отправки демо заказчику."
-    )
+    data = await state.get_data()
+    order_id = data.get("order_id")
+    source_ids = set(data.get("source_message_ids", []))
+    slots = list(data.get("slots", []))
+    received = int(data.get("received_count", 0))
+    if not order_id or received >= len(slots):
+        await state.clear()
+        await message.answer("Режим ручной загрузки закрыт. Открой заявку через /review.")
+        return
+    reply_id = message.reply_to_message.message_id if message.reply_to_message else None
+    if reply_id not in source_ids:
+        await message.answer("Отправь изображение ответом на исходный альбом с промтом и материалами.")
+        return
 
-
-async def save_manual_design_image(message: Message, order_id: str, source_message: Message) -> bool:
-    if source_message.photo:
-        media = source_message.photo[-1]
-        telegram_file_id = media.file_id
-        file_size = media.file_size
-        file_name = "chatgpt_demo.jpg"
-    elif source_message.document:
-        media = source_message.document
-        if media.mime_type not in {"image/jpeg", "image/png", "image/webp"}:
-            await message.answer("Нужен файл изображения JPG, PNG или WEBP.")
-            return False
-        telegram_file_id = media.file_id
-        file_size = media.file_size
-        file_name = media.file_name or "chatgpt_demo.png"
+    if message.photo:
+        media = message.photo[-1]
+        file_id, file_size, suggested_name = media.file_id, media.file_size, "manual_variant.jpg"
     else:
-        await message.answer("Пришли изображение JPG, PNG или WEBP.")
-        return False
-
+        media = message.document
+        if media.mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+            await message.answer("Принимаю только JPG, PNG и WEBP.")
+            return
+        file_id, file_size, suggested_name = media.file_id, media.file_size, media.file_name or "manual_variant.png"
     if file_size and file_size > settings.max_file_mb * 1024 * 1024:
-        await message.answer(f"Изображение превышает лимит {settings.max_file_mb} МБ.")
-        return False
+        await message.answer(f"Файл превышает лимит {settings.max_file_mb} МБ.")
+        return
 
-    async with Session() as db:
-        order = await db.get(Order, order_id)
-        if order is None:
-            await message.answer("Заявка не найдена.")
-            return False
-        if order.status not in {"accepted", "demo_review"}:
-            await message.answer(f"Нельзя добавить слайд: статус заявки — {order.status}.")
-            return False
-        brief = dict(order.brief or {})
-        current_assets = list(brief.get("design_assets", []))
-
+    slot = slots[received]
     order_dir = settings.storage_path / "orders" / order_id
-    order_dir.mkdir(parents=True, exist_ok=True)
-
+    incoming_dir = order_dir / "manual_uploads"
+    incoming_dir.mkdir(parents=True, exist_ok=True)
     try:
-        telegram_file = await message.bot.get_file(telegram_file_id)
-        original_ext = Path(telegram_file.file_path or "").suffix.lower()
-        if original_ext not in {".jpg", ".jpeg", ".png", ".webp"}:
-            original_ext = Path(file_name or "").suffix.lower()
-        if original_ext not in {".jpg", ".jpeg", ".png", ".webp"}:
-            original_ext = ".jpg"
-
-        slide_number = len(current_assets) + 1
-        final_path = order_dir / f"chatgpt_final_{slide_number:02d}{original_ext}"
-        demo_path = order_dir / f"chatgpt_demo_{slide_number:02d}.jpg"
-
-        await message.bot.download_file(telegram_file.file_path, destination=final_path)
-        await asyncio.to_thread(
-            make_watermarked_demo,
-            final_path,
-            demo_path,
-            settings.demo_long_edge,
-            settings.demo_watermark_text,
-        )
-
+        telegram_file = await message.bot.get_file(file_id)
+        ext = Path(telegram_file.file_path or "").suffix.lower()
+        if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+            ext = Path(suggested_name).suffix.lower()
+        if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+            ext = ".jpg"
+        source_path = incoming_dir / f"upload_{received + 1:02d}{ext}"
+        await message.bot.download_file(telegram_file.file_path, destination=source_path)
+        final_ext = ".png" if settings.text_overlay_enabled else ext
+        final_path = order_dir / f"slide_{slot['slide']:02d}_variant_{slot['variant']:02d}{final_ext}"
+        demo_path = order_dir / f"slide_{slot['slide']:02d}_variant_{slot['variant']:02d}_demo.jpg"
+        await _prepare_asset(source_path, final_path, demo_path, data.get("brief", {}))
         asset = {
-            "slide": slide_number,
-            "final_path": str(final_path),
-            "demo_path": str(demo_path),
-            "source": "chatgpt_manual",
+            "slide": int(slot["slide"]), "variant": int(slot["variant"]),
+            "final_path": str(final_path), "demo_path": str(demo_path), "source": "manual",
         }
-
-        async with Session() as db:
-            order = await db.get(Order, order_id)
-            if order is None or order.status not in {"accepted", "demo_review"}:
-                raise ImagePipelineError("Статус заявки изменился до сохранения изображения.")
-            updated_brief = dict(order.brief or {})
-            updated_assets = list(updated_brief.get("design_assets", []))
-            updated_assets.append(asset)
-            updated_brief["design_assets"] = updated_assets
-            order.brief = updated_brief
-            order.status = "demo_review"
-            await db.commit()
-
-        await message.answer_photo(
-            FSInputFile(demo_path),
-            caption=f"Демо по заявке {order_id[:8]} · слайд {slide_number}. Проверь результат.",
-            reply_markup=design_review_menu(order_id),
-        )
-        await message.answer(
-            "Оригинал сохранён в закрытом хранилище. Клиенту изображение ещё не отправлено. "
-            "Можно добавить следующий слайд или отправить подготовленные демо клиенту."
-        )
-        return True
-    except ImagePipelineError as exc:
-        await message.answer(f"Не удалось подготовить демо: {exc}")
-    except Exception as exc:
-        await message.answer(
-            f"Не удалось сохранить изображение: {type(exc).__name__}: {str(exc)[:250]}"
-        )
-    return False
+        updated_brief = await _persist_assets(order_id, [asset])
+        received += 1
+        await state.update_data(received_count=received)
+        await message.answer(f"Вариант {slot['variant']} слайда {slot['slide']} принят ({received}/{len(slots)}).")
+        if received >= len(slots):
+            await state.clear()
+            await _set_order_status(order_id, "demo_review")
+            await _send_owner_review(
+                message.bot, order_id, updated_brief,
+                note="Ручная загрузка завершена. Оригиналы сохранены без водяного знака.",
+            )
+    except Exception:
+        await message.answer("Не удалось обработать файл. Попробуй отправить изображение ещё раз ответом на исходный альбом.")
 
 
-@router.message(AdminAction.design_upload)
-async def receive_chatgpt_design(message: Message, state: FSMContext):
+@router.message(AdminAction.manual_images)
+async def manual_upload_help(message: Message, state: FSMContext):
     if message.from_user.id != settings.admin_id:
         return
     if (message.text or "").strip().casefold() in {"отмена", "/cancel"}:
         await state.clear()
-        await message.answer("Загрузка отменена.")
+        await message.answer("Ручная загрузка отменена. Заявка сохранена; открыть её можно через /review.")
         return
-    data = await state.get_data()
-    order_id = data.get("order_id")
-    if not order_id:
-        await state.clear()
-        await message.answer("Не удалось определить заявку. Открой её заново через /orders.")
-        return
-    saved = await save_manual_design_image(message, order_id, message)
-    if saved:
-        await state.clear()
-
-
-@router.message(Command("demo"))
-async def attach_chatgpt_demo(message: Message):
-    if message.from_user.id != settings.admin_id:
-        return
-
-    parts = (message.text or message.caption or "").split(maxsplit=1)
-    if len(parts) < 2 or len(parts[1].strip()) < 8:
-        await message.answer("Ответь на изображение командой /demo ID. Например: /demo 2c19e81f.")
-        return
-    prefix = parts[1].strip()
-    source_message = message if (message.photo or message.document) else message.reply_to_message
-    if source_message is None:
-        await message.answer(
-            "Сначала отправь изображение боту, затем ответь на него командой /demo ID. "
-            "Новый способ проще: открой заявку и нажми «Загрузить изображения из ChatGPT»."
-        )
-        return
-
-    async with Session() as db:
-        matches = list((await db.scalars(
-            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
-        )).all())
-    if not matches:
-        await message.answer("Заявка с таким ID не найдена.")
-        return
-    if len(matches) > 1:
-        await message.answer("Нашлось несколько заявок. Укажи больше символов ID.")
-        return
-
-    await save_manual_design_image(message, matches[0].id, source_message)
+    await message.answer("Ожидаю изображение ответом на исходный альбом. Отправляй готовые варианты по одному.")
 
 
 @router.message(Command("order"))
