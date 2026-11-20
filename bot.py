@@ -977,6 +977,7 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
             select(OrderFile).where(OrderFile.order_id == order_id).order_by(OrderFile.id)
         )).all())
 
+    await state.clear()
     total = _slide_total(brief)
     requested = int(brief.get("slides") or 1)
     if requested > settings.max_generation_slides:
@@ -1420,10 +1421,60 @@ async def forward_client_clarification(message: Message):
     await send_order_card(message.bot, settings.admin_id, order_id)
 
 
+async def recover_interrupted_orders() -> list[str]:
+    recovered: list[str] = []
+    async with Session() as db:
+        rows = list((await db.scalars(
+            select(Order).where(Order.status.in_(["generating", "sending_demo"]))
+        )).all())
+        for order in rows:
+            order_id = order.id
+            brief = dict(order.brief or {})
+            if order.status == "generating":
+                pending = brief.pop("generation_pending", None)
+                if pending:
+                    try:
+                        slide = int(pending.get("slide", 0))
+                        reservation = max(0.0, float(pending.get("reserved_cost_usd", 0.0)))
+                    except (TypeError, ValueError):
+                        slide, reservation = 0, 0.0
+                    if slide:
+                        already_saved = any(
+                            int(asset.get("slide", 0)) == slide
+                            for asset in brief.get("design_assets", [])
+                        )
+                        if not already_saved:
+                            blocked = list(brief.get("manual_required_slides", []))
+                            if slide not in blocked:
+                                blocked.append(slide)
+                            brief["manual_required_slides"] = blocked
+                            metrics = dict(brief.get("generation_metrics", {}))
+                            metrics["uncertain_requests"] = int(metrics.get("uncertain_requests", 0)) + 1
+                            metrics["estimated_cost_usd"] = round(
+                                float(metrics.get("estimated_cost_usd", 0.0)) + reservation, 4
+                            )
+                            brief["generation_metrics"] = metrics
+                order.brief = brief
+                order.status = "manual_pending"
+            else:
+                order.status = "demo_review"
+            recovered.append(order_id[:8])
+        if rows:
+            await db.commit()
+    return recovered
+
+
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    recovered = await recover_interrupted_orders()
     bot = Bot(settings.bot_token)
+    if recovered:
+        await bot.send_message(
+            settings.admin_id,
+            "Восстановлены незавершённые заявки: " + ", ".join(recovered) +
+            ". Проверь их через /orders; незавершённые API-запросы повторно автоматически не запускаются."
+        )
     dp = Dispatcher(storage=DatabaseStorage())
     dp.include_router(router)
     try:
