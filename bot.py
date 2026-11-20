@@ -743,10 +743,7 @@ async def admin_workflow_available(state: FSMContext, order_id: str) -> bool:
     if current is None:
         return True
     data = await state.get_data()
-    if current == AdminAction.manual_images.state and data.get("order_id") == order_id:
-        return True
-    await state.storage  # keep FSM backend access through the provided context
-    return False
+    return current == AdminAction.manual_images.state and data.get("order_id") == order_id
 
 
 def _slide_total(brief: dict) -> int:
