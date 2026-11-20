@@ -19,7 +19,7 @@ class ImageGenerationError(RuntimeError):
         self.uncertain = uncertain
 
 
-RETRYABLE_STATUSES = {408, 429, 502, 503, 504}
+RETRYABLE_STATUSES = {502, 503, 504}
 
 
 def build_product_prompt(brief: dict, slide_number: int, total_slides: int) -> str:
