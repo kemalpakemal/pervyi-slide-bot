@@ -130,7 +130,7 @@ async def generate_two_images(
                     },
                     files=files,
                 )
-            except (httpx.TimeoutException, httpx.NetworkError):
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
                 if attempt >= max_attempts:
                     raise ImageGenerationError("Сеть или таймаут генератора после трёх попыток.", uncertain=True)
                 delay = min(30.0, 2 ** (attempt - 1) + jitter(0.0, 0.5))
@@ -184,7 +184,7 @@ async def generate_two_images(
                     temp_path = path.with_suffix(path.suffix + ".tmp")
                     temp_path.write_bytes(content)
                     temp_path.replace(path)
-            except (ValueError, TypeError, KeyError):
+            except (ValueError, TypeError, KeyError, AttributeError):
                 raise ImageGenerationError(
                     "Генератор вернул некорректный ответ с изображениями.",
                     uncertain=True,
