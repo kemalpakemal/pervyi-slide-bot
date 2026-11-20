@@ -982,10 +982,10 @@ async def _send_manual_bundle(
 
 
 async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force_manual: bool = False) -> None:
-    if not await admin_workflow_available(state, order_id):
+    if await state.get_state() is not None:
         await bot.send_message(
             settings.admin_id,
-            "Сначала заверши или отмени ручную загрузку текущего заказа. Одновременно обрабатывается один ручной заказ."
+            "Сначала заверши или отмени текущий ручной сценарий. Генерацию нельзя запускать, пока активна загрузка изображений."
         )
         return
     async with Session() as db:
