@@ -14,6 +14,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     InputMediaDocument, InputMediaPhoto, KeyboardButton, Message,
@@ -1492,7 +1493,7 @@ async def main():
             "Восстановлены незавершённые заявки: " + ", ".join(recovered) +
             ". Проверь их через /orders; незавершённые API-запросы повторно автоматически не запускаются."
         )
-    dp = Dispatcher(storage=DatabaseStorage())
+    dp = Dispatcher(storage=DatabaseStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(router)
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
