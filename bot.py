@@ -928,14 +928,26 @@ async def _send_manual_bundle(
         )
         return
 
-    prompt = build_product_prompt(brief, int(slots[0]["slide"]), total)
-    sequence = ", ".join(f"слайд {x['slide']} · вариант {x['variant']}" for x in slots)
-    instruction = (
-        f" Подготовь отдельные изображения в этом порядке: {sequence}. "
-        "Первое фото во вложениях — товар, остальные — референсы. Не меняй форму, цвет, упаковку, "
-        "этикетку и текст на товаре. Верни одно изображение на каждый вариант."
-    )
-    caption = (prompt + instruction)[:1024]
+    def compact(key: str, limit: int) -> str:
+        value = brief.get(key, "")
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(item) for item in value)
+        return " ".join(str(value or "").split())[:limit] or "не указано"
+
+    sequence = ", ".join(f"{x['slide']}/{x['variant']}" for x in slots)
+    caption = (
+        "Создай отдельные карточки товара для маркетплейса. "
+        f"Товар: {compact('product', 100)}. "
+        f"Преимущества: {compact('advantages', 100)}. "
+        f"Обязательные тексты/факты: {compact('required_text', 100)}. "
+        f"Стиль: {compact('style', 50)}. Цвета: {compact('colors', 40)}. "
+        "Первое изображение во вложениях — сам товар, остальные — только референсы. "
+        "Строго сохрани форму, пропорции, цвет, конструкцию, упаковку, логотип, этикетку "
+        "и все надписи на товаре. Ничего не выдумывай. Не закрывай товар текстом. "
+        "Сделай по два разных варианта для каждого слайда. "
+        "Слайд 1 — обложка; следующие — отдельные инфографические преимущества. "
+        f"Порядок файлов: {sequence}. Один файл на одну позицию."
+    )[:1024]
 
     await state.clear()
     source_ids = await _send_album(bot, settings.admin_id, input_paths[:20], caption=caption, documents=True)
