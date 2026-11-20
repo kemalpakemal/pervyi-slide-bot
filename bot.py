@@ -1243,8 +1243,7 @@ async def receive_manual_variants(message: Message, state: FSMContext):
     order_id = data.get("order_id")
     source_ids = set(data.get("source_message_ids", []))
     slots = list(data.get("slots", []))
-    received = int(data.get("received_count", 0))
-    if not order_id or received >= len(slots):
+    if not order_id or not slots:
         await state.clear()
         await message.answer("Режим ручной загрузки закрыт. Открой заявку через /review.")
         return
@@ -1266,7 +1265,32 @@ async def receive_manual_variants(message: Message, state: FSMContext):
         await message.answer(f"Файл превышает лимит {settings.max_file_mb} МБ.")
         return
 
-    slot = slots[received]
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None or order.status not in {"manual_pending", "generating"}:
+            await state.clear()
+            await message.answer("Заявка больше не ожидает ручные изображения.")
+            return
+        brief = dict(order.brief or {})
+        assets = list(brief.get("design_assets", []))
+        if any(int(asset.get("source_message_id", 0)) == message.message_id for asset in assets):
+            await message.answer("Это изображение уже было принято. Дубликат пропущен.")
+            return
+        assigned = {
+            (int(asset.get("slide", 0)), int(asset.get("variant", 1)))
+            for asset in assets
+        }
+
+    remaining = [
+        slot for slot in slots
+        if (int(slot["slide"]), int(slot["variant"])) not in assigned
+    ]
+    if not remaining:
+        await state.clear()
+        await message.answer("Все варианты по этой заявке уже сохранены. Открой результаты через /review.")
+        return
+    slot = remaining[0]
+
     order_dir = settings.storage_path / "orders" / order_id
     incoming_dir = order_dir / "manual_uploads"
     incoming_dir.mkdir(parents=True, exist_ok=True)
@@ -1277,29 +1301,47 @@ async def receive_manual_variants(message: Message, state: FSMContext):
             ext = Path(suggested_name).suffix.lower()
         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
             ext = ".jpg"
-        source_path = incoming_dir / f"upload_{received + 1:02d}{ext}"
+        source_path = incoming_dir / f"upload_{message.message_id}{ext}"
         await message.bot.download_file(telegram_file.file_path, destination=source_path)
         final_ext = ".png" if settings.text_overlay_enabled else ext
         final_path = order_dir / f"slide_{slot['slide']:02d}_variant_{slot['variant']:02d}{final_ext}"
         demo_path = order_dir / f"slide_{slot['slide']:02d}_variant_{slot['variant']:02d}_demo.jpg"
         await _prepare_asset(source_path, final_path, demo_path, data.get("brief", {}))
         asset = {
-            "slide": int(slot["slide"]), "variant": int(slot["variant"]),
-            "final_path": str(final_path), "demo_path": str(demo_path), "source": "manual",
+            "slide": int(slot["slide"]),
+            "variant": int(slot["variant"]),
+            "final_path": str(final_path),
+            "demo_path": str(demo_path),
+            "source": "manual",
+            "source_message_id": message.message_id,
         }
         updated_brief = await _persist_assets(order_id, [asset])
-        received += 1
+        updated_assets = list(updated_brief.get("design_assets", []))
+        updated_slots = {
+            (int(item.get("slide", 0)), int(item.get("variant", 1)))
+            for item in updated_assets
+        }
+        received = sum(
+            1 for item in slots
+            if (int(item["slide"]), int(item["variant"])) in updated_slots
+        )
         await state.update_data(received_count=received)
-        await message.answer(f"Вариант {slot['variant']} слайда {slot['slide']} принят ({received}/{len(slots)}).")
+        await message.answer(
+            f"Вариант {slot['variant']} слайда {slot['slide']} принят ({received}/{len(slots)})."
+        )
         if received >= len(slots):
             await state.clear()
             await _set_order_status(order_id, "demo_review")
             await _send_owner_review(
-                message.bot, order_id, updated_brief,
+                message.bot,
+                order_id,
+                updated_brief,
                 note="Ручная загрузка завершена. Оригиналы сохранены без водяного знака.",
             )
     except Exception:
-        await message.answer("Не удалось обработать файл. Попробуй отправить изображение ещё раз ответом на исходный альбом.")
+        await message.answer(
+            "Не удалось обработать файл. Попробуй отправить изображение ещё раз ответом на исходный альбом."
+        )
 
 
 @router.message(AdminAction.manual_images)
