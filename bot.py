@@ -390,7 +390,7 @@ async def slides_step(message: Message, state: FSMContext):
 async def deadline_step(message: Message, state: FSMContext):
     await state.update_data(deadline=(message.text or "")[:500], files=[], reference_texts=[])
     await state.set_state(Brief.materials)
-    await message.answer("Отправь фото товара и референсы. Можно несколько сообщений. Когда закончишь, напиши «Готово».")
+    await message.answer("Сначала отправь главное фото товара, затем референсы. Можно несколько сообщений. Когда закончишь, напиши «Готово».")
 
 
 @router.message(Brief.materials, F.text.casefold() == "готово")
@@ -938,9 +938,10 @@ async def _send_manual_bundle(
     caption = (
         "Создай отдельные карточки товара для маркетплейса. "
         f"Товар: {compact('product', 100)}. "
-        f"Преимущества: {compact('advantages', 100)}. "
-        f"Обязательные тексты/факты: {compact('required_text', 100)}. "
-        f"Стиль: {compact('style', 50)}. Цвета: {compact('colors', 40)}. "
+        f"Преимущества: {compact('advantages', 80)}. "
+        f"Обязательные тексты/факты: {compact('required_text', 80)}. "
+        f"Стиль: {compact('style', 30)}. Цвета: {compact('colors', 30)}. "
+        f"Пожелания к референсам: {compact('reference_texts', 70)}. "
         "Первое изображение во вложениях — сам товар, остальные — только референсы. "
         "Строго сохрани форму, пропорции, цвет, конструкцию, упаковку, логотип, этикетку "
         "и все надписи на товаре. Ничего не выдумывай. Не закрывай товар текстом. "
