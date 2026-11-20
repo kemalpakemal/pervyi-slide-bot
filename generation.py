@@ -14,9 +14,10 @@ import httpx
 
 class ImageGenerationError(RuntimeError):
     """Safe, user-facing image generation failure. Never contains request secrets."""
-    def __init__(self, message: str, *, uncertain: bool = False):
+    def __init__(self, message: str, *, uncertain: bool = False, request_succeeded: bool = False):
         super().__init__(message)
         self.uncertain = uncertain
+        self.request_succeeded = request_succeeded
 
 
 RETRYABLE_STATUSES = {502, 503, 504}
@@ -184,7 +185,17 @@ async def generate_two_images(
                     temp_path.write_bytes(content)
                     temp_path.replace(path)
             except (ValueError, TypeError, KeyError):
-                raise ImageGenerationError("Генератор вернул некорректный ответ с изображениями.", uncertain=True)
+                raise ImageGenerationError(
+                    "Генератор вернул некорректный ответ с изображениями.",
+                    uncertain=True,
+                    request_succeeded=True,
+                )
+            except OSError:
+                raise ImageGenerationError(
+                    "Не удалось сохранить результат генератора.",
+                    uncertain=True,
+                    request_succeeded=True,
+                )
 
             return list(output_paths)
 
