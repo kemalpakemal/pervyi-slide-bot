@@ -92,5 +92,6 @@ Telegram-бот студии дизайна карточек товаров дл
 ```bash
 pip install -r requirements.txt
 python -m compileall -q .
+BOT_TOKEN=123456:test-token ADMIN_ID=1 DATABASE_URL=sqlite+aiosqlite:///./ci-smoke.db STORAGE_PATH=./ci-smoke-data python -c "import bot"
 python -m unittest discover -s tests -v
 ```
