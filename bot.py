@@ -685,8 +685,20 @@ async def review_order(message: Message):
             if order is None:
                 await message.answer("Нет заявок, ожидающих проверки.")
                 return
+    if order.status == "accepted":
+        await message.answer(
+            f"Заявка {order.id[:8]} уже принята. Нажми кнопку, чтобы загрузить готовое изображение из ChatGPT.",
+            reply_markup=design_upload_menu(order.id),
+        )
+        return
+    if order.status == "demo_review":
+        await message.answer(
+            f"По заявке {order.id[:8]} уже есть демо. Можно добавить следующий слайд или отправить все демо клиенту.",
+            reply_markup=design_review_menu(order.id),
+        )
+        return
     if order.status != "admin_review":
-        await message.answer(f"Заявка {order.id[:8]} уже не ожидает проверки. Текущий статус: {order.status}")
+        await message.answer(f"Заявка {order.id[:8]} уже обработана. Текущий статус: {order.status}")
         return
     await send_order_card(message.bot, message.chat.id, order.id)
 
