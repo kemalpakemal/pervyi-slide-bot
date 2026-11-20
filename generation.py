@@ -14,6 +14,9 @@ import httpx
 
 class ImageGenerationError(RuntimeError):
     """Safe, user-facing image generation failure. Never contains request secrets."""
+    def __init__(self, message: str, *, uncertain: bool = False):
+        super().__init__(message)
+        self.uncertain = uncertain
 
 
 RETRYABLE_STATUSES = {408, 429, 502, 503, 504}
@@ -126,7 +129,7 @@ async def generate_two_images(
                 )
             except (httpx.TimeoutException, httpx.NetworkError):
                 if attempt >= max_attempts:
-                    raise ImageGenerationError("Сеть или таймаут генератора после трёх попыток.")
+                    raise ImageGenerationError("Сеть или таймаут генератора после трёх попыток.", uncertain=True)
                 delay = min(30.0, 2 ** (attempt - 1) + jitter(0.0, 0.5))
                 await sleep(delay)
                 continue
@@ -135,12 +138,22 @@ async def generate_two_images(
                     handle.close()
 
             if response.status_code in RETRYABLE_STATUSES:
+                try:
+                    error_payload = response.json()
+                    error_code = str((error_payload.get("error") or {}).get("code") or "").lower()
+                except (ValueError, TypeError, AttributeError):
+                    error_code = ""
+                if response.status_code == 429 and error_code in {"credit_balance_exhausted", "billing_hard_limit_reached", "insufficient_quota"}:
+                    raise ImageGenerationError("Баланс или лимит расходов API исчерпан; повтор не выполнялся.")
                 if attempt >= max_attempts:
                     raise ImageGenerationError(
-                        f"Генератор временно недоступен (HTTP {response.status_code}) после трёх попыток."
+                        f"Генератор временно недоступен (HTTP {response.status_code}) после трёх попыток.",
+                        uncertain=True,
                     )
                 backoff = min(30.0, 2 ** (attempt - 1) + jitter(0.0, 0.5))
                 retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+                if retry_after is not None and retry_after > 300:
+                    raise ImageGenerationError("Генератор запросил слишком длинную паузу; переключаю заказ в ручной режим.", uncertain=True)
                 await sleep(max(backoff, retry_after or 0.0))
                 continue
 
