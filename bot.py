@@ -738,6 +738,17 @@ def manual_generation_menu(order_id: str):
     ])
 
 
+async def admin_workflow_available(state: FSMContext, order_id: str) -> bool:
+    current = await state.get_state()
+    if current is None:
+        return True
+    data = await state.get_data()
+    if current == AdminAction.manual_images.state and data.get("order_id") == order_id:
+        return True
+    await state.storage  # keep FSM backend access through the provided context
+    return False
+
+
 def _slide_total(brief: dict) -> int:
     try:
         requested = int(brief.get("slides") or 1)
@@ -974,6 +985,12 @@ async def _send_manual_bundle(
 
 
 async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force_manual: bool = False) -> None:
+    if not await admin_workflow_available(state, order_id):
+        await bot.send_message(
+            settings.admin_id,
+            "Сначала заверши или отмени ручную загрузку текущего заказа. Одновременно обрабатывается один ручной заказ."
+        )
+        return
     async with Session() as db:
         result = await db.execute(
             update(Order).where(
@@ -1170,6 +1187,12 @@ async def process_design_action(call: CallbackQuery, state: FSMContext):
         return
 
     if action == "manual":
+        if not await admin_workflow_available(state, order_id):
+            await call.answer(
+                "Сначала заверши или отмени ручную загрузку текущего заказа.",
+                show_alert=True,
+            )
+            return
         async with Session() as db:
             order = await db.get(Order, order_id)
             if order is None or order.status != "manual_pending":
