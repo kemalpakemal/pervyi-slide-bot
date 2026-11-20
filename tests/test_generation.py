@@ -56,6 +56,7 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual([p.read_bytes() for p in self.outputs], [b"png-bytes", b"png-bytes"])
         self.assertEqual(seen[0].headers["Idempotency-Key"], "order:abc:slide:1")
+        self.assertEqual(str(seen[0].url), "https://api.example.test/v1/images/edits")
         body = seen[0].read().decode("latin1")
         self.assertIn("image[]", body)
         self.assertIn("product.jpg", body)
@@ -143,6 +144,39 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 3)
         self.assertTrue(ctx.exception.uncertain)
         self.assertNotIn("internal test data", str(ctx.exception))
+
+
+    async def test_402_balance_error_is_not_retried(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(402, json={"error": {"message": "private billing data"}})
+
+        with self.assertRaises(ImageGenerationError) as ctx:
+            await self.call(handler)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("private billing data", str(ctx.exception))
+
+    async def test_408_client_timeout_status_is_not_retried(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(408)
+
+        with self.assertRaises(ImageGenerationError):
+            await self.call(handler)
+        self.assertEqual(len(calls), 1)
+
+    async def test_malformed_200_is_classified_as_successful_request_but_uncertain_result(self):
+        def handler(request):
+            return httpx.Response(200, json={"data": []})
+
+        with self.assertRaises(ImageGenerationError) as ctx:
+            await self.call(handler)
+        self.assertTrue(ctx.exception.request_succeeded)
+        self.assertTrue(ctx.exception.uncertain)
 
     async def test_prompt_preserves_product_identity(self):
         prompt = build_product_prompt({
