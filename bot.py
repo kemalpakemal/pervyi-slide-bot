@@ -2,6 +2,7 @@ import asyncio
 import enum
 import os
 import re
+import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,14 +16,16 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove, FSInputFile,
+    InputMediaDocument, InputMediaPhoto, KeyboardButton, Message,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, FSInputFile,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, delete, select
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from image_pipeline import ImagePipelineError, make_watermarked_demo
+from generation import ImageGenerationError, build_product_prompt, generate_two_images
+from image_pipeline import ImagePipelineError, apply_text_overlay, make_watermarked_demo
 
 
 class Settings(BaseSettings):
@@ -34,6 +37,17 @@ class Settings(BaseSettings):
     max_files_per_order: int = 12
     demo_long_edge: int = 700
     demo_watermark_text: str = "ПЕРВЫЙ СЛАЙД • ДЕМО"
+    image_mode: str = "auto"
+    openai_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_image_model: str = "gpt-image-2"
+    openai_image_size: str = "1024x1536"
+    openai_image_quality: str = "medium"
+    generation_timeout_seconds: int = 180
+    max_generation_slides: int = 10
+    max_order_cost_usd: float = 5.0
+    estimated_image_cost_usd: float = 0.25
+    text_overlay_enabled: bool = False
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
@@ -178,7 +192,7 @@ class Contact(StatesGroup):
 
 class AdminAction(StatesGroup):
     clarification = State()
-    design_upload = State()
+    manual_images = State()
 
 
 router = Router()
@@ -215,7 +229,7 @@ def order_action_menu(order_id: str):
 
 def generate_order_menu(order_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Как передать готовое демо", callback_data=f"manual-demo-help:{order_id}")]
+        [InlineKeyboardButton(text="Принять и создать", callback_data=f"design:create:{order_id}")]
     ])
 
 
@@ -504,11 +518,9 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
         )
         await call.answer("Заявка принята.")
         await call.message.answer(
-            f"Заявка {order_id[:8]} принята.\n\n"
-            "Создай слайд во встроенном генераторе изображений ChatGPT по брифу и фото товара. "
-            "Вернись сюда и нажми кнопку ниже — бот примет готовый файл, сохранит оригинал "
-            "и сделает демо с водяным знаком.",
-            reply_markup=design_upload_menu(order_id),
+            f"Заявка {order_id[:8]} принята. Нажми «Принять и создать», чтобы запустить автоматическую "
+            "генерацию или получить пакет для ручной обработки.",
+            reply_markup=generate_order_menu(order_id),
         )
     else:
         client_message = (
@@ -685,15 +697,15 @@ async def review_order(message: Message):
             if order is None:
                 await message.answer("Нет заявок, ожидающих проверки.")
                 return
-    if order.status == "accepted":
+    if order.status in {"accepted", "manual_pending"}:
         await message.answer(
-            f"Заявка {order.id[:8]} уже принята. Нажми кнопку, чтобы загрузить готовое изображение из ChatGPT.",
-            reply_markup=design_upload_menu(order.id),
+            f"Заявка {order.id[:8]} готова к генерации. Режим: {settings.image_mode}.",
+            reply_markup=generate_order_menu(order.id) if order.status == "accepted" else manual_generation_menu(order.id),
         )
         return
     if order.status == "demo_review":
         await message.answer(
-            f"По заявке {order.id[:8]} уже есть демо. Можно добавить следующий слайд или отправить все демо клиенту.",
+            f"По заявке {order.id[:8]} подготовлены оригиналы и демо.",
             reply_markup=design_review_menu(order.id),
         )
         return
