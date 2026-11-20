@@ -800,7 +800,9 @@ async def _prepare_asset(source_path: Path, final_path: Path, demo_path: Path, b
         await asyncio.to_thread(
             apply_text_overlay, source_path, final_path,
             str(brief.get("product") or "")[:80],
-            parse_benefits(brief.get("advantages")),
+            parse_benefits(
+                f"{brief.get('advantages') or ''}\n{brief.get('required_text') or ''}"
+            ),
         )
     elif source_path.resolve() != final_path.resolve():
         await asyncio.to_thread(shutil.copyfile, source_path, final_path)
@@ -1488,11 +1490,14 @@ async def main():
     recovered = await recover_interrupted_orders()
     bot = Bot(settings.bot_token)
     if recovered:
-        await bot.send_message(
-            settings.admin_id,
-            "Восстановлены незавершённые заявки: " + ", ".join(recovered) +
-            ". Проверь их через /orders; незавершённые API-запросы повторно автоматически не запускаются."
-        )
+        try:
+            await bot.send_message(
+                settings.admin_id,
+                "Восстановлены незавершённые заявки: " + ", ".join(recovered) +
+                ". Проверь их через /orders; незавершённые API-запросы повторно автоматически не запускаются."
+            )
+        except Exception:
+            pass
     dp = Dispatcher(storage=DatabaseStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(router)
     try:
