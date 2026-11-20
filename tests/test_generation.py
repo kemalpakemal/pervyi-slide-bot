@@ -104,6 +104,46 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
             await self.call(handler)
         self.assertEqual(len(calls), 3)
 
+
+    async def test_quota_429_is_not_retried(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(
+                429,
+                json={"error": {"code": "insufficient_quota", "message": "private account details"}},
+            )
+
+        with self.assertRaises(ImageGenerationError) as ctx:
+            await self.call(handler)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("private account details", str(ctx.exception))
+
+    async def test_non_retryable_400_is_not_retried(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(400, json={"error": {"message": "private request detail"}})
+
+        with self.assertRaises(ImageGenerationError):
+            await self.call(handler)
+        self.assertEqual(len(calls), 1)
+
+    async def test_timeout_retries_three_times(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            raise httpx.ReadTimeout("internal test data")
+
+        with self.assertRaises(ImageGenerationError) as ctx:
+            await self.call(handler)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(ctx.exception.uncertain)
+        self.assertNotIn("internal test data", str(ctx.exception))
+
     async def test_prompt_preserves_product_identity(self):
         prompt = build_product_prompt({
             "product": "Термокружка",
