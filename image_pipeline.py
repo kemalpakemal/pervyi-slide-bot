@@ -44,7 +44,7 @@ def apply_text_overlay(
         width=max(1, width // 500),
     )
     title_font = _font(max(24, width // 18), bold=True)
-    body_font = _font(max(17, width //  thirty := 30), bold=False)
+    body_font = _font(max(17, width // 30), bold=False)
     y = pad + max(16, panel_h // 10)
     if title.strip():
         draw.text((pad * 1.5, y), title.strip()[:80], font=title_font, fill=(255, 255, 255, 245))
