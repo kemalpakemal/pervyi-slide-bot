@@ -180,7 +180,7 @@ async def generate_two_images(
                     temp_path.write_bytes(content)
                     temp_path.replace(path)
             except (ValueError, TypeError, KeyError):
-                raise ImageGenerationError("Генератор вернул некорректный ответ с изображениями.")
+                raise ImageGenerationError("Генератор вернул некорректный ответ с изображениями.", uncertain=True)
 
             return list(output_paths)
 
