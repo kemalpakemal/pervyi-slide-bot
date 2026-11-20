@@ -35,6 +35,7 @@ def build_product_prompt(brief: dict, slide_number: int, total_slides: int) -> s
     required_text = clean("required_text")
     style = clean("style")
     colors = clean("colors")
+    references = clean("reference_texts", 1200)
     slide_role = (
         "обложка товара: главный оффер и визуальная иерархия"
         if slide_number == 1
@@ -45,6 +46,7 @@ def build_product_prompt(brief: dict, slide_number: int, total_slides: int) -> s
         f"Товар: {product}. Слайд {slide_number} из {total_slides}, задача: {slide_role}. "
         f"Преимущества из брифа: {advantages}. Обязательные надписи и факты: {required_text}. "
         f"Стиль: {style}. Цветовые пожелания: {colors}. "
+        f"Текстовые описания референсов: {references}. "
         "Первое входное изображение — единственный источник истины о товаре; остальные изображения "
         "используй только как референсы композиции и стиля. Сохрани без изменений геометрию, форму, "
         "пропорции, конструкцию, оттенок и фактуру товара, его комплектность, логотип, этикетку, "
