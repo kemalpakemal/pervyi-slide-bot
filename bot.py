@@ -178,6 +178,7 @@ class Contact(StatesGroup):
 
 class AdminAction(StatesGroup):
     clarification = State()
+    design_upload = State()
 
 
 router = Router()
@@ -504,11 +505,10 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
         await call.answer("Заявка принята.")
         await call.message.answer(
             f"Заявка {order_id[:8]} принята.\n\n"
-            "Чтобы сделать макет через ChatGPT: отправь в ChatGPT фото товара и бриф этой заявки. "
-            "Когда изображение будет готово, нажми «Поделиться» → Telegram → @pervy_slide_bot.\n\n"
-            f"Затем ответь на полученное фото командой /demo {order_id[:8]}. "
-            "Бот сохранит оригинал, наложит водяной знак и покажет демо. "
-            "Клиент получит его только после твоего нажатия «Отправить демо клиенту».",
+            "Создай слайд во встроенном генераторе изображений ChatGPT по брифу и фото товара. "
+            "Вернись сюда и нажми кнопку ниже — бот примет готовый файл, сохранит оригинал "
+            "и сделает демо с водяным знаком.",
+            reply_markup=design_upload_menu(order_id),
         )
     else:
         client_message = (
@@ -693,10 +693,16 @@ async def review_order(message: Message):
 
 
 
+def design_upload_menu(order_id: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Загрузить изображения из ChatGPT", callback_data=f"design:upload:{order_id}")]
+    ])
+
+
 def design_review_menu(order_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Добавить следующий слайд", callback_data=f"design:upload:{order_id}")],
         [InlineKeyboardButton(text="Отправить демо клиенту", callback_data=f"design:send:{order_id}")],
-        [InlineKeyboardButton(text="Перегенерировать", callback_data=f"design:again:{order_id}")],
     ])
 
 
@@ -721,7 +727,7 @@ async def generate_order_design(message: Message):
 
 
 @router.callback_query(F.data.startswith("design:"))
-async def process_design_action(call: CallbackQuery):
+async def process_design_action(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != settings.admin_id:
         await call.answer("Это действие доступно только администратору.", show_alert=True)
         return
@@ -739,6 +745,22 @@ async def process_design_action(call: CallbackQuery):
             return
         brief = dict(order.brief or {})
         assets = brief.get("design_assets", [])
+
+        if action == "upload":
+            if order.status not in {"accepted", "demo_review"}:
+                await call.answer(f"Нельзя загрузить слайд в статусе {order.status}.", show_alert=True)
+                return
+            await state.clear()
+            await state.update_data(order_id=order_id)
+            await state.set_state(AdminAction.design_upload)
+            await call.answer()
+            await call.message.answer(
+                f"Заявка {order_id[:8]}. Теперь отправь сюда готовое изображение из ChatGPT "
+                "как фото или файлом JPG, PNG или WEBP. Я сохраню оригинал и подготовлю демо с водяным знаком. "
+                "Клиент ничего не получит, пока ты не нажмёшь «Отправить демо клиенту».\n\n"
+                "Чтобы выйти без загрузки, напиши «Отмена»."
+            )
+            return
 
         if action == "again":
             if order.status != "demo_review":
@@ -818,28 +840,7 @@ async def manual_demo_help(call: CallbackQuery):
     )
 
 
-@router.message(Command("demo"))
-async def attach_chatgpt_demo(message: Message):
-    if message.from_user.id != settings.admin_id:
-        return
-
-    parts = (message.text or message.caption or "").split(maxsplit=1)
-    if len(parts) < 2 or len(parts[1].strip()) < 8:
-        await message.answer("Ответь на изображение командой /demo ID. Например: /demo 2c19e81f.")
-        return
-    prefix = parts[1].strip()
-
-    source_message = message if (message.photo or message.document) else message.reply_to_message
-    if source_message is None:
-        await message.answer(
-            "Сначала поделись готовым изображением из ChatGPT в этот чат, "
-            "затем ответь на него командой /demo ID."
-        )
-        return
-
-    telegram_file_id = None
-    file_size = None
-    file_name = None
+async def save_manual_design_image(message: Message, order_id: str, source_message: Message) -> bool:
     if source_message.photo:
         media = source_message.photo[-1]
         telegram_file_id = media.file_id
@@ -847,35 +848,28 @@ async def attach_chatgpt_demo(message: Message):
         file_name = "chatgpt_demo.jpg"
     elif source_message.document:
         media = source_message.document
-        if not (media.mime_type or "").startswith("image/"):
+        if media.mime_type not in {"image/jpeg", "image/png", "image/webp"}:
             await message.answer("Нужен файл изображения JPG, PNG или WEBP.")
-            return
+            return False
         telegram_file_id = media.file_id
         file_size = media.file_size
         file_name = media.file_name or "chatgpt_demo.png"
     else:
-        await message.answer("Команда /demo должна быть ответом на изображение.")
-        return
+        await message.answer("Пришли изображение JPG, PNG или WEBP.")
+        return False
 
     if file_size and file_size > settings.max_file_mb * 1024 * 1024:
         await message.answer(f"Изображение превышает лимит {settings.max_file_mb} МБ.")
-        return
+        return False
 
     async with Session() as db:
-        matches = list((await db.scalars(
-            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
-        )).all())
-        if not matches:
-            await message.answer("Заявка с таким ID не найдена.")
-            return
-        if len(matches) > 1:
-            await message.answer("Нашлось несколько заявок. Укажи больше символов ID.")
-            return
-        order = matches[0]
-        if order.status not in {"accepted", "demo_review", "demo_sent"}:
-            await message.answer(f"Сначала прими заявку. Сейчас её статус: {order.status}.")
-            return
-        order_id = order.id
+        order = await db.get(Order, order_id)
+        if order is None:
+            await message.answer("Заявка не найдена.")
+            return False
+        if order.status not in {"accepted", "demo_review"}:
+            await message.answer(f"Нельзя добавить слайд: статус заявки — {order.status}.")
+            return False
         brief = dict(order.brief or {})
         current_assets = list(brief.get("design_assets", []))
 
@@ -912,8 +906,8 @@ async def attach_chatgpt_demo(message: Message):
 
         async with Session() as db:
             order = await db.get(Order, order_id)
-            if order is None:
-                raise ImagePipelineError("Заявка не найдена при сохранении изображения.")
+            if order is None or order.status not in {"accepted", "demo_review"}:
+                raise ImagePipelineError("Статус заявки изменился до сохранения изображения.")
             updated_brief = dict(order.brief or {})
             updated_assets = list(updated_brief.get("design_assets", []))
             updated_assets.append(asset)
@@ -928,16 +922,68 @@ async def attach_chatgpt_demo(message: Message):
             reply_markup=design_review_menu(order_id),
         )
         await message.answer(
-            "Изображение сохранено. Клиенту оно ещё не отправлено. "
-            "После проверки нажми «Отправить демо клиенту» под превью."
+            "Оригинал сохранён в закрытом хранилище. Клиенту изображение ещё не отправлено. "
+            "Можно добавить следующий слайд или отправить подготовленные демо клиенту."
         )
+        return True
     except ImagePipelineError as exc:
         await message.answer(f"Не удалось подготовить демо: {exc}")
     except Exception as exc:
         await message.answer(
             f"Не удалось сохранить изображение: {type(exc).__name__}: {str(exc)[:250]}"
         )
+    return False
 
+
+@router.message(AdminAction.design_upload)
+async def receive_chatgpt_design(message: Message, state: FSMContext):
+    if message.from_user.id != settings.admin_id:
+        return
+    if (message.text or "").strip().casefold() in {"отмена", "/cancel"}:
+        await state.clear()
+        await message.answer("Загрузка отменена.")
+        return
+    data = await state.get_data()
+    order_id = data.get("order_id")
+    if not order_id:
+        await state.clear()
+        await message.answer("Не удалось определить заявку. Открой её заново через /orders.")
+        return
+    saved = await save_manual_design_image(message, order_id, message)
+    if saved:
+        await state.clear()
+
+
+@router.message(Command("demo"))
+async def attach_chatgpt_demo(message: Message):
+    if message.from_user.id != settings.admin_id:
+        return
+
+    parts = (message.text or message.caption or "").split(maxsplit=1)
+    if len(parts) < 2 or len(parts[1].strip()) < 8:
+        await message.answer("Ответь на изображение командой /demo ID. Например: /demo 2c19e81f.")
+        return
+    prefix = parts[1].strip()
+    source_message = message if (message.photo or message.document) else message.reply_to_message
+    if source_message is None:
+        await message.answer(
+            "Сначала отправь изображение боту, затем ответь на него командой /demo ID. "
+            "Новый способ проще: открой заявку и нажми «Загрузить изображения из ChatGPT»."
+        )
+        return
+
+    async with Session() as db:
+        matches = list((await db.scalars(
+            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
+        )).all())
+    if not matches:
+        await message.answer("Заявка с таким ID не найдена.")
+        return
+    if len(matches) > 1:
+        await message.answer("Нашлось несколько заявок. Укажи больше символов ID.")
+        return
+
+    await save_manual_design_image(message, matches[0].id, source_message)
 
 
 @router.message(Command("order"))
