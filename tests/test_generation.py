@@ -94,6 +94,51 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn("test-secret", str(ctx.exception))
 
+    async def test_504_stops_after_three_attempts(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(504)
+
+        with self.assertRaises(ImageGenerationError):
+            await self.call(handler)
+        self.assertEqual(len(calls), 3)
+
+    async def test_connection_error_retries_three_times(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            raise httpx.ConnectError("private network detail")
+
+        with self.assertRaises(ImageGenerationError) as ctx:
+            await self.call(handler)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(ctx.exception.uncertain)
+        self.assertNotIn("private network detail", str(ctx.exception))
+
+    async def test_missing_api_key_fails_without_network(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(200, json={"data": []})
+
+        with self.assertRaises(ImageGenerationError):
+            await generate_two_images(
+                api_key="",
+                base_url="https://api.example.test/v1",
+                model="gpt-image-2",
+                prompt="prompt",
+                image_paths=[self.product],
+                output_paths=self.outputs,
+                idempotency_key="order:no-key",
+                transport=httpx.MockTransport(handler),
+                sleep=self.no_sleep,
+            )
+        self.assertEqual(calls, [])
+
     async def test_503_stops_after_three_attempts(self):
         calls = []
 
