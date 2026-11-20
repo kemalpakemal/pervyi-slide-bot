@@ -1056,6 +1056,7 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
             order.brief = updated
             await db.commit()
 
+        request_succeeded = False
         try:
             await generate_two_images(
                 api_key=settings.openai_api_key or "",
@@ -1070,6 +1071,7 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
                 size=settings.openai_image_size,
                 quality=settings.openai_image_quality,
             )
+            request_succeeded = True
             new_assets = []
             for variant, raw_path in enumerate(raw_paths, start=1):
                 await _prepare_asset(raw_path, final_paths[variant - 1], demo_paths[variant - 1], brief)
@@ -1088,9 +1090,10 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
             completed[slide] = {1, 2}
         except ImageGenerationError as exc:
             brief = await _persist_assets(
-                order_id, [], clear_pending=True, failed_attempt=True,
+                order_id, [], api_call=exc.request_succeeded,
+                clear_pending=True, failed_attempt=True,
                 uncertain_slide=slide if exc.uncertain else None,
-                estimated_cost=reservation if exc.uncertain else 0.0,
+                estimated_cost=reservation if (exc.uncertain or exc.request_succeeded) else 0.0,
             )
             if exc.uncertain:
                 current_cost += reservation
@@ -1098,7 +1101,8 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
             break
         except Exception:
             brief = await _persist_assets(
-                order_id, [], clear_pending=True, failed_attempt=True,
+                order_id, [], api_call=request_succeeded,
+                clear_pending=True, failed_attempt=True,
                 uncertain_slide=slide, estimated_cost=reservation,
             )
             current_cost += reservation
