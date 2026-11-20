@@ -132,7 +132,7 @@ async def generate_two_images(
                     },
                     files=files,
                 )
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+            except httpx.TransportError:
                 if attempt >= max_attempts:
                     raise ImageGenerationError("Сеть или таймаут генератора после трёх попыток.", uncertain=True)
                 delay = min(30.0, 2 ** (attempt - 1) + jitter(0.0, 0.5))
