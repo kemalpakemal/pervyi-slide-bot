@@ -138,13 +138,6 @@ async def generate_two_images(
                     handle.close()
 
             if response.status_code in RETRYABLE_STATUSES:
-                try:
-                    error_payload = response.json()
-                    error_code = str((error_payload.get("error") or {}).get("code") or "").lower()
-                except (ValueError, TypeError, AttributeError):
-                    error_code = ""
-                if response.status_code == 429 and error_code in {"credit_balance_exhausted", "billing_hard_limit_reached", "insufficient_quota"}:
-                    raise ImageGenerationError("Баланс или лимит расходов API исчерпан; повтор не выполнялся.")
                 if attempt >= max_attempts:
                     raise ImageGenerationError(
                         f"Генератор временно недоступен (HTTP {response.status_code}) после трёх попыток.",
@@ -158,11 +151,20 @@ async def generate_two_images(
                 continue
 
             if response.status_code >= 400:
-                # Provider text may contain user/account data; never echo it into bot messages or logs.
+                # Never echo provider error bodies: they may contain account or credential details.
                 if response.status_code in {401, 403}:
                     raise ImageGenerationError("Генератор отклонил авторизацию или доступ к модели.")
                 if response.status_code == 402:
                     raise ImageGenerationError("Недостаточно средств или исчерпан баланс API.")
+                if response.status_code == 429:
+                    try:
+                        error_payload = response.json()
+                        error_code = str((error_payload.get("error") or {}).get("code") or "").lower()
+                    except (ValueError, TypeError, AttributeError):
+                        error_code = ""
+                    if error_code in {"credit_balance_exhausted", "billing_hard_limit_reached", "insufficient_quota"}:
+                        raise ImageGenerationError("Баланс или лимит расходов API исчерпан; повтор не выполнялся.")
+                    raise ImageGenerationError("Превышен лимит запросов API; повтор не выполнялся.")
                 raise ImageGenerationError(
                     f"Генератор отклонил запрос (HTTP {response.status_code}); повтор не выполнялся."
                 )
