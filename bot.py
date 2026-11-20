@@ -1273,9 +1273,10 @@ async def receive_manual_variants(message: Message, state: FSMContext):
             return
         brief = dict(order.brief or {})
         assets = list(brief.get("design_assets", []))
-        if any(int(asset.get("source_message_id", 0)) == message.message_id for asset in assets):
-            await message.answer("Это изображение уже было принято. Дубликат пропущен.")
-            return
+        duplicate_upload = any(
+            int(asset.get("source_message_id", 0)) == message.message_id
+            for asset in assets
+        )
         assigned = {
             (int(asset.get("slide", 0)), int(asset.get("variant", 1)))
             for asset in assets
@@ -1285,6 +1286,17 @@ async def receive_manual_variants(message: Message, state: FSMContext):
         slot for slot in slots
         if (int(slot["slide"]), int(slot["variant"])) not in assigned
     ]
+    if duplicate_upload:
+        if not remaining:
+            await state.clear()
+            await _set_order_status(order_id, "demo_review")
+            await _send_owner_review(
+                message.bot, order_id, brief,
+                note="Ручная загрузка восстановлена после повторного Telegram-сообщения.",
+            )
+        else:
+            await message.answer("Это изображение уже было принято. Дубликат пропущен.")
+        return
     if not remaining:
         await state.clear()
         await message.answer("Все варианты по этой заявке уже сохранены. Открой результаты через /review.")
