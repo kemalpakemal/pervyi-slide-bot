@@ -416,7 +416,7 @@ async def admin_health_button(message: Message):
     await health(message)
 
 
-@router.message(F.text == "🆔 Найти по ID")
+@router.message(F.text.in_({"🆔 Найти по ID", "🔎 Открыть заявку"}))
 async def admin_review_button(message: Message, state: FSMContext):
     if not admin_only(message.from_user.id):
         return
@@ -428,7 +428,7 @@ async def admin_review_button(message: Message, state: FSMContext):
 @router.message(AdminAction.lookup_order, F.text.in_({
     "📥 Все заявки", "🕒 На проверке", "🎨 На генерации", "👁 На согласовании",
     "💰 Оплаты", "👥 Клиенты", "⚙️ Настройки", "📣 Рассылка", "📊 Статистика",
-    "⚙️ Состояние бота", "👤 Режим клиента", "🆔 Найти по ID",
+    "⚙️ Состояние бота", "👤 Режим клиента", "🆔 Найти по ID", "🔎 Открыть заявку",
 }))
 async def admin_lookup_navigation(message: Message, state: FSMContext):
     if not admin_only(message.from_user.id):
@@ -457,7 +457,7 @@ async def admin_lookup_navigation(message: Message, state: FSMContext):
         await health(message)
     elif value == "👤 Режим клиента":
         await admin_client_mode(message)
-    elif value == "🆔 Найти по ID":
+    elif value in {"🆔 Найти по ID", "🔎 Открыть заявку"}:
         await state.set_state(AdminAction.lookup_order)
         await message.answer("Введи ID заявки минимум из 8 символов. Для отмены нажми «Отмена».")
 
