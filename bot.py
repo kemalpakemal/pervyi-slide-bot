@@ -383,6 +383,27 @@ async def admin_lookup_order(message: Message, state: FSMContext):
     await review_order(message, f"/review {value}")
 
 
+@router.message(F.text == "👤 Режим клиента")
+async def admin_client_mode(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer("Клиентское меню включено. Для возврата к панели администратора напиши /start.", reply_markup=menu())
+
+
+@router.message(F.text == "💳 Оплаты")
+async def admin_payments_button(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer("Подтверждение оплат пока не реализовано. Оригиналы не выдаются без отдельного подтверждения.", reply_markup=admin_menu())
+
+
+@router.message(F.text == "📨 Напоминания")
+async def admin_reminders_button(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer("Отправка напоминаний пока не реализована.", reply_markup=admin_menu())
+
+
 @router.message(F.text == "Заказать карточку")
 async def begin(message: Message, state: FSMContext):
     if admin_only(message.from_user.id):
