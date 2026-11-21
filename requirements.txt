@@ -6,3 +6,4 @@ PyYAML>=6.0
 Pillow>=10.4
 httpx>=0.27,<1.0
 pydantic-settings>=2.5
+posthog>=8,<9

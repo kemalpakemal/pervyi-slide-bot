@@ -4,7 +4,7 @@ on:
   push:
     branches: ["feat/**"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "feat/hybrid-image-generation"]
 
 jobs:
   unit-tests:
