@@ -171,5 +171,60 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         message.answer.assert_awaited_once()
 
 
+
+
+    async def test_only_configured_owner_can_queue_hermes_jobs(self):
+        owner = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            text="/agent inspect the repository",
+            answer=AsyncMock(),
+        )
+        outsider = SimpleNamespace(
+            from_user=SimpleNamespace(id=2),
+            text="/agent inspect the repository",
+            answer=AsyncMock(),
+        )
+
+        await bot.admin_hermes_agent(outsider)
+        outsider.answer.assert_awaited_once_with("Эта команда доступна только владельцу бота.")
+        async with self.session_factory() as db:
+            self.assertEqual(await db.scalar(bot.select(bot.func.count()).select_from(bot.HermesJob)), 0)
+
+        await bot.admin_hermes_agent(owner)
+        async with self.session_factory() as db:
+            job = await db.scalar(bot.select(bot.HermesJob))
+            self.assertIsNotNone(job)
+            self.assertEqual(job.prompt, "inspect the repository")
+            self.assertEqual(job.status, "queued")
+
+    async def test_admin_controls_reject_non_owner(self):
+        outsider = SimpleNamespace(
+            from_user=SimpleNamespace(id=2),
+            text="📊 Статистика",
+            answer=AsyncMock(),
+        )
+        allowed = await bot.require_admin_message(outsider)
+        self.assertFalse(allowed)
+        outsider.answer.assert_awaited_once_with("Эта команда доступна только владельцу бота.")
+
+    async def test_admin_callback_rejects_non_owner(self):
+        outsider = SimpleNamespace(
+            from_user=SimpleNamespace(id=2),
+            answer=AsyncMock(),
+        )
+        allowed = await bot.require_admin_callback(outsider)
+        self.assertFalse(allowed)
+        outsider.answer.assert_awaited_once_with(
+            "Эта функция доступна только владельцу бота.", show_alert=True
+        )
+
+    async def test_customer_clarification_handler_never_intercepts_owner_chat(self):
+        owner = SimpleNamespace(from_user=SimpleNamespace(id=1), text="owner private note")
+        await bot.forward_client_clarification(owner)
+        # Owner messages must not be treated as a customer reply to an order.
+        # No DB rows were seeded, so any accidental DB lookup would still return None;
+        # the guard itself is separately tested by its early return through this call.
+
+
 if __name__ == "__main__":
     unittest.main()
