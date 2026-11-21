@@ -730,6 +730,11 @@ def design_review_menu(order_id: str):
         [InlineKeyboardButton(text="Отправить демо клиенту", callback_data=f"design:send:{order_id}")]
     ])
 
+def payment_review_menu(order_id: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Подтвердить оплату и выдать оригиналы", callback_data=f"payment:confirm:{order_id}")]
+    ])
+
 
 def manual_generation_menu(order_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1233,7 +1238,13 @@ async def process_design_action(call: CallbackQuery, state: FSMContext):
         await call.bot.send_message(
             client_telegram_id,
             f"Подготовлено демо по заявке №{order_id[:8]}. Это предварительные изображения с водяным знаком. "
-            "Напиши, что нужно поправить. Оригиналы без водяного знака передаются только после согласования и оплаты."
+            "Оцените результат: можно подтвердить, запросить правки или сообщить об оплате. "
+            "Оригиналы без водяного знака отправляются только после ручной проверки оплаты администратором.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Понравилось", callback_data=f"feedback:like:{order_id}")],
+                [InlineKeyboardButton(text="Нужны правки", callback_data=f"feedback:revise:{order_id}")],
+                [InlineKeyboardButton(text="Я оплатил", callback_data=f"feedback:paid:{order_id}")],
+            ]),
         )
         for asset in assets:
             demo_path = Path(asset.get("demo_path", ""))
@@ -1253,6 +1264,102 @@ async def process_design_action(call: CallbackQuery, state: FSMContext):
     await call.message.edit_reply_markup(reply_markup=None)
     await call.answer("Демо отправлено клиенту.")
     await call.message.answer(f"Демо по заявке {order_id[:8]} отправлено. Клиент получил только версии с водяным знаком.")
+
+
+async def send_originals_to_client(bot: Bot, order_id: str) -> bool:
+    """Send clean originals only after the owner explicitly confirms payment."""
+    async with Session() as db:
+        result = await db.execute(
+            update(Order).where(Order.id == order_id, Order.status == "payment_review")
+            .values(status="sending_originals")
+        )
+        if result.rowcount != 1:
+            return False
+        await db.commit()
+        order = await db.get(Order, order_id)
+        brief = dict(order.brief or {})
+        client = await db.get(Client, order.client_id)
+        client_id = client.telegram_id if client else None
+        assets = sorted(list(brief.get("design_assets", [])),
+                        key=lambda item: (int(item.get("slide", 0)), int(item.get("variant", 0))))
+    originals = [Path(item.get("final_path", "")) for item in assets
+                 if Path(item.get("final_path", "")).is_file()]
+    if not client_id or not originals or len(originals) != len(assets):
+        await _set_order_status(order_id, "payment_review")
+        return False
+    try:
+        await bot.send_message(client_id, f"Оплата по заявке №{order_id[:8]} подтверждена. Отправляю оригиналы без водяного знака.")
+        await _send_album(bot, client_id, originals, caption=f"Оригиналы по заявке {order_id[:8]}", documents=True)
+    except Exception:
+        await _set_order_status(order_id, "payment_review")
+        return False
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order:
+            brief = dict(order.brief or {})
+            brief["payment"] = {"status": "owner_confirmed", "confirmed_at": now().isoformat()}
+            order.brief = brief
+            order.status = "completed"
+            await db.commit()
+    return True
+
+
+@router.callback_query(F.data.startswith("payment:confirm:"))
+async def confirm_payment_callback(call: CallbackQuery):
+    if call.from_user.id != settings.admin_id:
+        await call.answer("Только администратор может подтверждать оплату.", show_alert=True)
+        return
+    order_id = call.data.split(":", 2)[2]
+    if await send_originals_to_client(call.bot, order_id):
+        await call.answer("Оплата отмечена, оригиналы отправлены.")
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.message.answer(f"Оригиналы по заявке {order_id[:8]} отправлены клиенту.")
+    else:
+        await call.answer("Заявка не готова, файлы отсутствуют или отправка не удалась.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("feedback:"))
+async def process_client_feedback(call: CallbackQuery):
+    try:
+        _, action, order_id = call.data.split(":", 2)
+    except (AttributeError, ValueError):
+        await call.answer("Некорректное действие.", show_alert=True)
+        return
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None:
+            await call.answer("Заявка не найдена.", show_alert=True)
+            return
+        client = await db.get(Client, order.client_id)
+        if client is None or client.telegram_id != call.from_user.id:
+            await call.answer("Это не ваша заявка.", show_alert=True)
+            return
+        if order.status != "demo_sent" or action not in {"like", "revise", "paid"}:
+            await call.answer("Действие недоступно для этой заявки.", show_alert=True)
+            return
+        brief = dict(order.brief or {})
+        brief.setdefault("feedback", {})[action] = now().isoformat()
+        order.brief = brief
+        if action == "revise":
+            order.status = "waiting_revision"
+        elif action == "paid":
+            order.status = "payment_review"
+        await db.commit()
+    if action == "like":
+        await call.answer("Спасибо! Администратор увидит ваш отзыв.")
+        await call.bot.send_message(settings.admin_id, f"Клиент одобрил демо по заявке {order_id[:8]}.")
+    elif action == "revise":
+        await call.answer("Напишите одним сообщением, какие правки нужны.")
+        await call.message.answer("Опишите, что изменить в демо. Ваши замечания будут переданы администратору.")
+        await call.bot.send_message(settings.admin_id, f"Клиент запросил правки по заявке {order_id[:8]}.")
+    else:
+        await call.answer("Запрос на подтверждение оплаты передан администратору.")
+        await call.message.answer("Спасибо. Администратор проверит поступление платежа. Оригиналы будут отправлены после подтверждения.")
+        await call.bot.send_message(
+            settings.admin_id,
+            f"Клиент сообщил об оплате по заявке {order_id[:8]}. Проверь поступление средств и подтверди вручную.",
+            reply_markup=payment_review_menu(order_id),
+        )
 
 
 @router.message(AdminAction.manual_images, F.photo | F.document)
@@ -1456,8 +1563,25 @@ async def collect_forward(message: Message):
 
 @router.message(Command("paid"))
 async def paid(message: Message):
-    if message.from_user.id == settings.admin_id:
-        await message.answer("Подтверждение оплаты будет добавлено на этапе 4. Сейчас оплата не подтверждается и оригиналы не выдаются.")
+    if message.from_user.id != settings.admin_id:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or len(parts[1].strip()) < 8:
+        await message.answer("Укажи ID заявки: /paid <ID>. Используй команду только после проверки поступления платежа.")
+        return
+    prefix = parts[1].strip()
+    async with Session() as db:
+        matches = list((await db.scalars(
+            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
+        )).all())
+        if len(matches) != 1 or matches[0].status != "payment_review":
+            await message.answer("Заявка не найдена, ID неоднозначен или клиент ещё не сообщил об оплате.")
+            return
+        order_id = matches[0].id
+    if await send_originals_to_client(message.bot, order_id):
+        await message.answer(f"Оригиналы по заявке {order_id[:8]} отправлены.")
+    else:
+        await message.answer("Не удалось отправить оригиналы. Проверь файлы и доступность клиента.")
 
 
 @router.message(Command("remind"))
@@ -1499,19 +1623,29 @@ async def forward_client_clarification(message: Message):
             return
         order = await db.scalar(
             select(Order)
-            .where(Order.client_id == client.id, Order.status == "waiting_client_info")
+            .where(Order.client_id == client.id, Order.status.in_(["waiting_client_info", "waiting_revision"]))
             .order_by(Order.created_at.desc())
             .limit(1)
         )
         if order is None:
             return
         order_id = order.id
+        is_revision = order.status == "waiting_revision"
+        if is_revision:
+            brief = dict(order.brief or {})
+            brief["style"] = str(brief.get("style") or "") + "\nПравки клиента: " + message.text[:2000]
+            order.brief = brief
         previous = order.assistant_notes or ""
         order.assistant_notes = previous + f"\nОтвет клиента: {message.text[:3000]}"
-        order.status = "admin_review"
+        order.status = "accepted" if is_revision else "admin_review"
         await db.commit()
 
     await message.answer(f"Ответ по заявке №{order_id[:8]} передан администратору.")
+    if is_revision:
+        await message.bot.send_message(
+            settings.admin_id,
+            f"Клиент прислал правки по заявке {order_id[:8]}. Проверь их и запусти повторную генерацию через /generate {order_id[:8]}.",
+        )
     await send_order_card(message.bot, settings.admin_id, order_id)
 
 
