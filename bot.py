@@ -2600,6 +2600,16 @@ async def deny_unknown_commands(message: Message):
         await message.answer("Эта команда не поддерживается. Используй кнопки клиентского меню.")
 
 
+@router.callback_query()
+async def deny_unknown_callbacks(call: CallbackQuery):
+    # Every actionable inline button is explicitly routed above. Unknown callback
+    # data is not allowed to fall through to a stateful or internal handler.
+    if call.from_user is None or not admin_only(call.from_user.id):
+        await call.answer("Действие недоступно.", show_alert=True)
+    else:
+        await call.answer("Неизвестное действие.", show_alert=True)
+
+
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
