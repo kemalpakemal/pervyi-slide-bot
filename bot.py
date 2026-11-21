@@ -320,7 +320,7 @@ async def start(message: Message, state: FSMContext):
         "На ключевых этапах работу проверяет администратор."
     )
     if admin_only(message.from_user.id):
-        welcome += "\\n\\nПанель администратора. Управляй заявками кнопками ниже."
+        welcome += "\n\nПанель администратора. Управляй заявками кнопками ниже."
         await message.answer(welcome, reply_markup=admin_menu())
     else:
         await message.answer(welcome, reply_markup=menu())
@@ -349,7 +349,7 @@ async def admin_pending_orders(message: Message):
     await message.answer(
         "Заявки, ожидающие проверки:\n" +
         "\n".join(f"{row.id[:8]} · {row.status} · {row.source}" for row in rows) +
-        "\\n\\nЧтобы открыть заявку, нажми «Открыть заявку» и отправь её ID.",
+        "\n\nЧтобы открыть заявку, нажми «Открыть заявку» и отправь её ID.",
         reply_markup=admin_menu(),
     )
 
