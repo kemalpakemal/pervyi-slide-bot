@@ -561,14 +561,63 @@ async def admin_settings(message: Message):
 
 @router.message(F.text == "📊 Статистика")
 async def admin_stats(message: Message):
-    if not admin_only(message.from_user.id): return
+    if not admin_only(message.from_user.id):
+        return
+
+    week_ago = now() - timedelta(days=7)
+    attention_statuses = ["admin_review", "waiting_client_info", "demo_review"]
+    active_statuses = ["accepted", "generating", "manual_pending", "sending_demo"]
+
     async with Session() as db:
-        total_orders = await db.scalar(select(func.count(Order.id)))
-        total_clients = await db.scalar(select(func.count(Client.id)))
-        statuses = list((await db.execute(select(Order.status, func.count(Order.id)).group_by(Order.status))).all())
-    lines = [f"Клиентов: {total_clients or 0}", f"Заявок: {total_orders or 0}", "По статусам:"]
-    lines += [f"• {status}: {count}" for status, count in statuses]
-    await message.answer("\n".join(lines), reply_markup=admin_menu())
+        total_clients = int(await db.scalar(select(func.count(Client.id))) or 0)
+        new_clients = int(await db.scalar(
+            select(func.count(Client.id)).where(Client.created_at >= week_ago)
+        ) or 0)
+        total_orders = int(await db.scalar(select(func.count(Order.id))) or 0)
+        new_orders = int(await db.scalar(
+            select(func.count(Order.id)).where(Order.created_at >= week_ago)
+        ) or 0)
+        needs_attention = int(await db.scalar(
+            select(func.count(Order.id)).where(Order.status.in_(attention_statuses))
+        ) or 0)
+        in_progress = int(await db.scalar(
+            select(func.count(Order.id)).where(Order.status.in_(active_statuses))
+        ) or 0)
+        demos_sent = int(await db.scalar(
+            select(func.count(Order.id)).where(Order.status == "demo_sent")
+        ) or 0)
+
+        payment_count = int(await db.scalar(select(func.count(Payment.id))) or 0)
+        payment_total = int(await db.scalar(
+            select(func.coalesce(func.sum(Payment.amount), 0))
+        ) or 0)
+        week_payment_count = int(await db.scalar(
+            select(func.count(Payment.id)).where(Payment.created_at >= week_ago)
+        ) or 0)
+        week_payment_total = int(await db.scalar(
+            select(func.coalesce(func.sum(Payment.amount), 0))
+            .where(Payment.created_at >= week_ago)
+        ) or 0)
+
+    def rubles(value: int) -> str:
+        return f"{value:,}".replace(",", " ") + " ₽"
+
+    lines = [
+        "СТАТИСТИКА СТУДИИ",
+        "",
+        f"Клиенты: {total_clients} · новых за 7 дней: {new_clients}",
+        f"Заявки: {total_orders} · новых за 7 дней: {new_orders}",
+        "",
+        f"Требуют внимания: {needs_attention}",
+        f"В работе: {in_progress}",
+        f"Демо отправлено: {demos_sent}",
+        "",
+        f"Зарегистрировано оплат: {payment_count} · {rubles(payment_total)}",
+        f"За последние 7 дней: {week_payment_count} оплат · {rubles(week_payment_total)}",
+        "",
+        "Период активности: последние 7 дней (UTC).",
+    ]
+    await message.answer("\\n".join(lines), reply_markup=admin_menu())
 
 
 @router.message(F.text == "📣 Рассылка")
