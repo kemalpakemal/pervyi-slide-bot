@@ -1,5 +1,6 @@
 import asyncio
 import enum
+import hmac
 import os
 import re
 import shutil
@@ -15,6 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.fsm.storage.memory import SimpleEventIsolation
+from aiohttp import web
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     InputMediaDocument, InputMediaPhoto, KeyboardButton, Message,
@@ -32,6 +34,7 @@ from image_pipeline import ImagePipelineError, apply_text_overlay, make_watermar
 class Settings(BaseSettings):
     bot_token: str
     admin_id: int
+    hermes_bridge_token: str | None = None
     database_url: str = "sqlite+aiosqlite:///./card_studio.db"
     storage_path: Path = Path("./data")
     max_file_mb: int = 15
@@ -207,6 +210,18 @@ class Payment(Base):
     amount: Mapped[int] = mapped_column(Integer)
     note: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class HermesJob(Base):
+    __tablename__ = "hermes_jobs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    prompt: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    result: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 router = Router()
@@ -1112,6 +1127,132 @@ async def admin_open_order(call: CallbackQuery):
         await call.answer("Карточка заявки отправлена.")
     else:
         await call.answer("Заявка не найдена.", show_alert=True)
+
+
+
+
+# Hermes phone bridge: the existing aiogram bot remains the sole Telegram
+# getUpdates consumer. The phone connects outbound over HTTPS and polls jobs.
+def _hermes_bridge_authorized(request: web.Request) -> bool:
+    expected = settings.hermes_bridge_token or ""
+    supplied = request.headers.get("Authorization", "")
+    return bool(expected) and hmac.compare_digest(supplied, f"Bearer {expected}")
+
+
+def _hermes_bridge_unauthorized() -> web.Response:
+    return web.json_response({"error": "unauthorized"}, status=401)
+
+
+async def hermes_bridge_health(request: web.Request) -> web.Response:
+    if not _hermes_bridge_authorized(request):
+        return _hermes_bridge_unauthorized()
+    return web.json_response({"ok": True, "service": "pervyi-slide-hermes-bridge"})
+
+
+async def hermes_bridge_next(request: web.Request) -> web.Response:
+    if not _hermes_bridge_authorized(request):
+        return _hermes_bridge_unauthorized()
+    async with Session() as db:
+        statement = (
+            select(HermesJob)
+            .where(HermesJob.status == "queued")
+            .order_by(HermesJob.created_at.asc())
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        )
+        job = await db.scalar(statement)
+        if job is None:
+            return web.json_response({"job": None})
+        job.status = "running"
+        job.claimed_at = now()
+        await db.commit()
+        return web.json_response({"job": {"id": job.id, "prompt": job.prompt}})
+
+
+async def hermes_bridge_result(request: web.Request) -> web.Response:
+    if not _hermes_bridge_authorized(request):
+        return _hermes_bridge_unauthorized()
+    try:
+        payload = await request.json()
+    except (ValueError, web.HTTPException):
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    job_id = str(payload.get("job_id") or "").strip()
+    outcome = str(payload.get("status") or "").strip().lower()
+    result_text = str(payload.get("result") or "")[:24000]
+    error_text = str(payload.get("error") or "")[:4000]
+    if not job_id or outcome not in {"done", "failed"}:
+        return web.json_response({"error": "job_id_and_valid_status_required"}, status=400)
+
+    async with Session() as db:
+        job = await db.get(HermesJob, job_id)
+        if job is None:
+            return web.json_response({"error": "job_not_found"}, status=404)
+        if job.status != "running":
+            return web.json_response({"error": "job_not_running"}, status=409)
+        job.status = outcome
+        job.result = result_text if outcome == "done" else None
+        job.error = error_text if outcome == "failed" else None
+        job.finished_at = now()
+        await db.commit()
+
+    bot: Bot = request.app["bot"]
+    heading = f"Hermes · задача {job_id[:8]} · " + ("готово" if outcome == "done" else "ошибка")
+    body = result_text if outcome == "done" else (error_text or "Hermes завершил задачу с ошибкой.")
+    if not body:
+        body = "Hermes завершил задачу без текстового ответа."
+    await bot.send_message(settings.admin_id, heading)
+    for offset in range(0, len(body), 3500):
+        await bot.send_message(
+            settings.admin_id,
+            body[offset:offset + 3500],
+            disable_web_page_preview=True,
+        )
+    return web.json_response({"ok": True})
+
+
+@router.message(Command("agent"))
+async def admin_hermes_agent(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    if not settings.hermes_bridge_token:
+        await message.answer("Связь с Hermes на телефоне ещё не настроена.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    prompt = parts[1].strip() if len(parts) > 1 else ""
+    if not prompt:
+        await message.answer("Формат: /agent задача для Hermes на телефоне")
+        return
+    if len(prompt) > 4000:
+        await message.answer("Слишком длинная задача. Максимум — 4000 символов.")
+        return
+    job_id = str(uuid.uuid4())
+    async with Session() as db:
+        db.add(HermesJob(id=job_id, prompt=prompt, status="queued"))
+        await db.commit()
+    await message.answer(
+        f"Задача {job_id[:8]} поставлена в очередь Hermes на телефоне. "
+        "Результат придёт сюда после выполнения."
+    )
+
+
+@router.message(Command("agent_status"))
+async def admin_hermes_status(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    async with Session() as db:
+        jobs = list((await db.scalars(
+            select(HermesJob).order_by(HermesJob.created_at.desc()).limit(8)
+        )).all())
+    if not jobs:
+        await message.answer("Задач Hermes пока нет.")
+        return
+    labels = {"queued": "в очереди", "running": "выполняется", "done": "готово", "failed": "ошибка"}
+    lines = ["Последние задачи Hermes:"]
+    for job in jobs:
+        prompt = " ".join(job.prompt.split())[:100]
+        lines.append(f"{job.id[:8]} · {labels.get(job.status, job.status)}\n{prompt}")
+    await message.answer("\n\n".join(lines))
 
 
 @router.message(Command("orders"))
@@ -2046,6 +2187,21 @@ async def main():
         await conn.run_sync(Base.metadata.create_all)
     recovered = await recover_interrupted_orders()
     bot = Bot(settings.bot_token)
+    bridge_runner = None
+    if settings.hermes_bridge_token:
+        bridge_app = web.Application(client_max_size=64 * 1024)
+        bridge_app["bot"] = bot
+        bridge_app.router.add_get("/_bridge/hermes/health", hermes_bridge_health)
+        bridge_app.router.add_get("/_bridge/hermes/next", hermes_bridge_next)
+        bridge_app.router.add_post("/_bridge/hermes/result", hermes_bridge_result)
+        bridge_runner = web.AppRunner(bridge_app)
+        await bridge_runner.setup()
+        bridge_site = web.TCPSite(
+            bridge_runner,
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", "8080")),
+        )
+        await bridge_site.start()
     if recovered:
         try:
             await bot.send_message(
@@ -2060,6 +2216,8 @@ async def main():
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        if bridge_runner is not None:
+            await bridge_runner.cleanup()
         await dp.storage.close()
         await bot.session.close()
         await engine.dispose()
