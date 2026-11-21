@@ -304,7 +304,7 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
         "waiting_client_info": "Ждём клиента", "accepted": "Принята",
         "generating": "Генерация", "manual_pending": "Ручная загрузка",
         "demo_review": "Демо на проверке", "sending_demo": "Отправка демо",
-        "demo_sent": "Демо отправлено", "paid": "Оплачена",
+        "demo_sent": "Демо отправлено", "awaiting_payment": "Ожидает оплаты", "paid": "Оплачена",
         "delivering_originals": "Выдача оригиналов", "paid_delivery_pending": "Оплата принята · выдача ожидает",
         "completed": "Завершена", "privacy_erased": "Данные обезличены",
         "rejected": "Отклонена", "cancelled": "Отменена",
@@ -577,11 +577,9 @@ async def admin_list_status(message: Message, statuses: list[str]):
 async def admin_payment_menu(message: Message):
     if not admin_only(message.from_user.id): return
     async with Session() as db:
-        rows = list((await db.scalars(
-            select(Order).where(Order.status.in_(["awaiting_payment", "paid", "paid_delivery_pending", "completed"]))
-            .order_by(Order.created_at.desc()).limit(20)
+        payments = list((await db.scalars(
+            select(Payment).order_by(Payment.created_at.desc()).limit(20)
         )).all())
-        payments = list((await db.scalars(select(Payment).order_by(Payment.created_at.desc()).limit(20))).all())
         pending_quotes = list((await db.scalars(
             select(Order).where(Order.status == "awaiting_payment")
             .order_by(Order.created_at.desc()).limit(15)
@@ -1154,7 +1152,7 @@ async def send_orders_list(message: Message, statuses: list[str] | None = None, 
         "waiting_client_info": "Ждём клиента", "accepted": "Принята",
         "generating": "Генерация", "manual_pending": "Ручная загрузка",
         "demo_review": "Демо на проверке", "sending_demo": "Отправка демо",
-        "demo_sent": "Демо отправлено", "paid": "Оплачена",
+        "demo_sent": "Демо отправлено", "awaiting_payment": "Ожидает оплаты", "paid": "Оплачена",
         "delivering_originals": "Выдача оригиналов", "paid_delivery_pending": "Оплата принята · выдача ожидает",
         "completed": "Завершена", "privacy_erased": "Данные обезличены",
         "rejected": "Отклонена", "cancelled": "Отменена",
@@ -2284,11 +2282,11 @@ async def quote_order(message: Message):
         order_id = order.id
 
     text = (
-        f"Стоимость заказа №{order_id[:8]}: {amount} ₽.\\n"
+        f"Стоимость заказа №{order_id[:8]}: {amount} ₽.\n"
         "После подтверждения оплаты студия отправит оригиналы изображений без водяного знака."
     )
     if note:
-        text += f"\\nКомментарий: {note}"
+        text += f"\nКомментарий: {note}"
     try:
         await message.bot.send_message(client_id, text)
     except Exception:
