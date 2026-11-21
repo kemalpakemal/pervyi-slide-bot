@@ -1146,7 +1146,7 @@ async def contact_collect(message: Message, state: FSMContext):
 
 @router.message(Command("health"))
 async def health(message: Message):
-    if message.from_user.id != settings.admin_id:
+    if not await require_admin_message(message):
         return
     try:
         async with Session() as db:
@@ -2527,6 +2527,8 @@ async def forget(message: Message):
 @router.message(F.text)
 async def forward_client_clarification(message: Message):
     # Перехватываем обычный текст только когда от этого клиента действительно ждут уточнение.
+    if message.from_user is None or admin_only(message.from_user.id):
+        return
     async with Session() as db:
         client = await db.scalar(select(Client).where(Client.telegram_id == message.from_user.id))
         if client is None:
