@@ -3,13 +3,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import email.utils
+import io
 import mimetypes
 import random
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 
 import httpx
+from PIL import Image, ImageOps
+
+from image_pipeline import ImagePipelineError, validate_image_file
 
 
 class ImageGenerationError(RuntimeError):
@@ -21,6 +26,38 @@ class ImageGenerationError(RuntimeError):
 
 
 RETRYABLE_STATUSES = {502, 503, 504}
+SUPPORTED_OUTPUT_FORMATS = {"JPEG", "PNG", "WEBP"}
+MAX_GENERATED_IMAGE_PIXELS = 40_000_000
+
+
+def _normalise_generated_image(content: bytes) -> bytes:
+    """Verify provider output, apply EXIF orientation and persist a safe PNG."""
+    if not content or len(content) > 30 * 1024 * 1024:
+        raise ValueError("invalid image size")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(content)) as image:
+                image_format = (image.format or "").upper()
+                if image_format not in SUPPORTED_OUTPUT_FORMATS:
+                    raise ValueError("unsupported image format")
+                if image.width < 32 or image.height < 32:
+                    raise ValueError("image is too small")
+                if image.width * image.height > MAX_GENERATED_IMAGE_PIXELS:
+                    raise ValueError("image dimensions are too large")
+                image.verify()
+            with Image.open(io.BytesIO(content)) as image:
+                oriented = ImageOps.exif_transpose(image)
+                oriented.load()
+                normalized = oriented.convert("RGB")
+                buffer = io.BytesIO()
+                normalized.save(buffer, format="PNG", optimize=True)
+                result = buffer.getvalue()
+                if not result:
+                    raise ValueError("empty normalized image")
+                return result
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise ValueError("provider returned an invalid image") from exc
 
 
 def build_product_prompt(brief: dict, slide_number: int, total_slides: int) -> str:
@@ -101,8 +138,18 @@ async def generate_two_images(
         raise ValueError("Exactly two output paths are required.")
     if not image_paths:
         raise ImageGenerationError("Нет исходного фото товара.")
+    if not idempotency_key.strip():
+        raise ValueError("idempotency_key must not be empty")
     if max_attempts < 1:
         raise ValueError("max_attempts must be positive")
+
+    validated_inputs: list[tuple[Path, str]] = []
+    for path in image_paths:
+        try:
+            image_format, _dimensions = validate_image_file(Path(path))
+        except (ImagePipelineError, OSError):
+            raise ImageGenerationError("Одно из исходных изображений повреждено или имеет неподдерживаемый формат.") from None
+        validated_inputs.append((Path(path), image_format))
 
     endpoint = base_url.rstrip("/") + "/images/edits"
     timeout = httpx.Timeout(timeout_seconds)
@@ -111,10 +158,14 @@ async def generate_two_images(
             files = []
             opened = []
             try:
-                for path in image_paths:
+                for path, image_format in validated_inputs:
                     handle = path.open("rb")
                     opened.append(handle)
-                    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                    mime = {
+                        "JPEG": "image/jpeg",
+                        "PNG": "image/png",
+                        "WEBP": "image/webp",
+                    }[image_format]
                     files.append(("image[]", (path.name, handle, mime)))
                 response = await client.post(
                     endpoint,
@@ -181,10 +232,13 @@ async def generate_two_images(
                 if len(encoded) != 2 or not all(encoded):
                     raise ValueError("missing image data")
                 decoded = [base64.b64decode(item, validate=True) for item in encoded]
-                for path, content in zip(output_paths, decoded):
+                normalized = [_normalise_generated_image(item) for item in decoded]
+                for path, image_bytes in zip(output_paths, normalized):
+                    if path.suffix.lower() != ".png":
+                        raise ValueError("output paths must use .png")
                     path.parent.mkdir(parents=True, exist_ok=True)
                     temp_path = path.with_suffix(path.suffix + ".tmp")
-                    temp_path.write_bytes(content)
+                    temp_path.write_bytes(image_bytes)
                     temp_path.replace(path)
             except (ValueError, TypeError, KeyError, AttributeError):
                 raise ImageGenerationError(
