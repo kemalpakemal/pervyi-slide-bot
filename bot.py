@@ -274,17 +274,33 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
         brief = dict(order.brief or {})
         client_id = client.telegram_id if client else 0
         username = client.username if client else None
+        first_name = client.first_name if client else None
         status = order.status
         source = order.source
         notes = order.assistant_notes
         created_at = order.created_at
+        payments = list((await db.scalars(
+            select(Payment).where(Payment.order_id == order_id).order_by(Payment.created_at.desc())
+        )).all())
 
+    status_labels = {
+        "lead": "Лид", "brief": "Черновик", "admin_review": "Ожидает проверки",
+        "waiting_client_info": "Ожидает ответа клиента", "accepted": "Принята",
+        "generating": "Генерация", "manual_pending": "Ожидает ручные изображения",
+        "demo_review": "Демо на проверке", "sending_demo": "Отправка демо",
+        "demo_sent": "Демо отправлено", "paid": "Оплачена",
+        "completed": "Завершена", "rejected": "Отклонена", "cancelled": "Отменена",
+    }
+    created_label = created_at.strftime("%d.%m.%Y %H:%M UTC") if created_at else "неизвестно"
+    client_label = first_name or "Имя не указано"
+    client_label += f" (@{username})" if username else ""
     lines = [
-        f"Заявка: {order_id}",
-        f"Статус: {status}",
-        f"Клиент: @{username}" if username else f"Клиент ID: {client_id}",
+        f"ЗАЯВКА №{order_id[:8]}",
+        f"Статус: {status_labels.get(status, status)}",
+        f"Клиент: {client_label}",
         f"Telegram ID: {client_id}",
-        f"Источник: {source}",
+        f"Создана: {created_label}",
+        f"Источник: {'анкета бота' if source == 'bot' else source}",
     ]
     for key, label in (
         ("platform", "Площадка"), ("product", "Товар"), ("advantages", "Преимущества"),
@@ -296,8 +312,19 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
             lines.append(f"{label}: {value}")
     if notes:
         lines.append(f"Дополнительная информация: {notes}")
-    lines.append(f"Файлов: {len(attachments)}")
-    keyboard = order_action_menu(order_id) if status == "admin_review" else None
+    lines.append(f"Вложений: {len(attachments)}")
+    if payments:
+        lines.append("Оплаты: " + "; ".join(f"{p.amount} RUB" for p in payments))
+    if status == "accepted":
+        keyboard = generate_order_menu(order_id)
+    elif status == "manual_pending":
+        keyboard = manual_generation_menu(order_id)
+    elif status == "demo_review":
+        keyboard = design_review_menu(order_id)
+    elif status == "admin_review":
+        keyboard = order_action_menu(order_id)
+    else:
+        keyboard = None
     await bot.send_message(admin_chat_id, "\n".join(lines), reply_markup=keyboard)
     for item in attachments:
         try:
@@ -352,20 +379,7 @@ async def admin_all_orders(message: Message):
 async def admin_pending_orders(message: Message):
     if not admin_only(message.from_user.id):
         return
-    async with Session() as db:
-        rows = list((await db.scalars(
-            select(Order).where(Order.status == "admin_review")
-            .order_by(Order.created_at.desc()).limit(20)
-        )).all())
-    if not rows:
-        await message.answer("Новых заявок на проверке нет.", reply_markup=admin_menu())
-        return
-    await message.answer(
-        "Заявки, ожидающие проверки:\n" +
-        "\n".join(f"{row.id[:8]} · {row.status} · {row.source}" for row in rows) +
-        "\n\nЧтобы открыть заявку, нажми «Открыть заявку» и отправь её ID.",
-        reply_markup=admin_menu(),
-    )
+    await send_orders_list(message, statuses=["admin_review"], limit=30)
 
 
 @router.message(F.text == "⚙️ Состояние бота")
@@ -432,19 +446,7 @@ async def admin_reviewing_orders(message: Message):
 
 
 async def admin_list_status(message: Message, statuses: list[str]):
-    async with Session() as db:
-        rows = list((await db.scalars(
-            select(Order).where(Order.status.in_(statuses))
-            .order_by(Order.created_at.desc()).limit(30)
-        )).all())
-    if not rows:
-        await message.answer("Заявок в этом разделе нет.", reply_markup=admin_menu())
-        return
-    await message.answer(
-        "\n".join(f"{x.id[:8]} · {x.status} · {x.source}" for x in rows) +
-        "\n\nОткрой нужную заявку через «🔎 Открыть заявку».",
-        reply_markup=admin_menu(),
-    )
+    await send_orders_list(message, statuses=statuses, limit=30)
 
 
 @router.message(F.text == "💰 Оплаты")
@@ -915,16 +917,92 @@ async def health(message: Message):
         await message.answer("Бот отвечает, но база данных недоступна.")
 
 
+async def send_orders_list(message: Message, statuses: list[str] | None = None, limit: int = 20):
+    async with Session() as db:
+        query = (
+            select(Order, Client)
+            .join(Client, Client.id == Order.client_id)
+            .order_by(Order.created_at.desc())
+            .limit(limit)
+        )
+        if statuses:
+            query = query.where(Order.status.in_(statuses))
+        records = list((await db.execute(query)).all())
+        order_ids = [order.id for order, _client in records]
+        file_counts = {}
+        if order_ids:
+            counts = await db.execute(
+                select(OrderFile.order_id, func.count(OrderFile.id))
+                .where(OrderFile.order_id.in_(order_ids))
+                .group_by(OrderFile.order_id)
+            )
+            file_counts = {order_id: count for order_id, count in counts.all()}
+
+    if not records:
+        await message.answer("Заявок в этом разделе нет.", reply_markup=admin_menu())
+        return
+
+    status_labels = {
+        "lead": "Лид", "brief": "Черновик", "admin_review": "На проверке",
+        "waiting_client_info": "Ждём клиента", "accepted": "Принята",
+        "generating": "Генерация", "manual_pending": "Ручная загрузка",
+        "demo_review": "Демо на проверке", "sending_demo": "Отправка демо",
+        "demo_sent": "Демо отправлено", "paid": "Оплачена",
+        "completed": "Завершена", "rejected": "Отклонена", "cancelled": "Отменена",
+    }
+    await message.answer(
+        f"Заявки · показано {len(records)}"
+        + (f" · фильтр: {', '.join(statuses)}" if statuses else ""),
+        reply_markup=admin_menu(),
+    )
+    for offset in range(0, len(records), 5):
+        chunk = records[offset:offset + 5]
+        lines = []
+        buttons = []
+        for order, client in chunk:
+            brief = dict(order.brief or {})
+            who = client.first_name or "Имя не указано"
+            if client.username:
+                who += f" (@{client.username})"
+            product = str(brief.get("product") or order.assistant_notes or "Товар не указан")
+            product = " ".join(product.split())[:110]
+            platform = brief.get("platform") or "Площадка не указана"
+            slides = brief.get("slides")
+            slide_label = f"{slides} слайд(ов)" if slides else "количество слайдов не указано"
+            created = order.created_at.strftime("%d.%m.%Y %H:%M UTC") if order.created_at else "дата неизвестна"
+            file_count = file_counts.get(order.id, 0)
+            lines.append(
+                f"№{order.id[:8]} · {status_labels.get(order.status, order.status)}\n"
+                f"Клиент: {who}\n"
+                f"Товар: {product}\n"
+                f"Площадка: {platform} · {slide_label}\n"
+                f"Материалов: {file_count} · {created}"
+            )
+            buttons.append([InlineKeyboardButton(
+                text=f"Открыть {order.id[:8]}",
+                callback_data=f"admin:open:{order.id}",
+            )])
+        await message.answer("\n\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("admin:open:"))
+async def admin_open_order(call: CallbackQuery):
+    if not admin_only(call.from_user.id):
+        await call.answer("Доступ только администратору.", show_alert=True)
+        return
+    order_id = call.data.split(":", 2)[2]
+    found = await send_order_card(call.bot, call.message.chat.id, order_id)
+    if found:
+        await call.answer("Карточка заявки отправлена.")
+    else:
+        await call.answer("Заявка не найдена.", show_alert=True)
+
+
 @router.message(Command("orders"))
 async def orders(message: Message):
     if message.from_user.id != settings.admin_id:
         return
-    async with Session() as db:
-        rows = list((await db.scalars(select(Order).order_by(Order.created_at.desc()).limit(20))).all())
-    if not rows:
-        await message.answer("Заказов пока нет.")
-        return
-    await message.answer("Последние заказы:\n" + "\n".join(f"{x.id[:8]} · {x.status} · {x.source}" for x in rows))
+    await send_orders_list(message)
 
 
 @router.message(Command("review"))
@@ -958,25 +1036,7 @@ async def review_order(message: Message, command_text: str | None = None):
             if order is None:
                 await message.answer("Нет заявок, ожидающих проверки.")
                 return
-    if order.status in {"accepted", "manual_pending"}:
-        await message.answer(
-            f"Заявка {order.id[:8]} готова к генерации. Режим: {settings.image_mode}.",
-            reply_markup=generate_order_menu(order.id) if order.status == "accepted" else manual_generation_menu(order.id),
-        )
-        return
-    if order.status == "demo_review":
-        await message.answer(
-            f"По заявке {order.id[:8]} подготовлены оригиналы и демо.",
-            reply_markup=design_review_menu(order.id),
-        )
-        return
-    if order.status != "admin_review":
-        await message.answer(f"Заявка {order.id[:8]} уже обработана. Текущий статус: {order.status}")
-        return
     await send_order_card(message.bot, message.chat.id, order.id)
-
-
-
 
 
 def parse_benefits(value) -> list[str]:
