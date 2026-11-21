@@ -325,8 +325,104 @@ async def start(message: Message, state: FSMContext):
         await message.answer(welcome, reply_markup=menu())
 
 
+
+@router.message(F.text == "📥 Все заявки")
+async def admin_all_orders(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await orders(message)
+
+
+@router.message(F.text == "🕒 На проверке")
+async def admin_pending_orders(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    async with Session() as db:
+        rows = list((await db.scalars(
+            select(Order).where(Order.status == "admin_review")
+            .order_by(Order.created_at.desc()).limit(20)
+        )).all())
+    if not rows:
+        await message.answer("Новых заявок на проверке нет.", reply_markup=admin_menu())
+        return
+    await message.answer(
+        "Заявки, ожидающие проверки:\\n" +
+        "\\n".join(f"{row.id[:8]} · {row.status} · {row.source}" for row in rows) +
+        "\\n\\nЧтобы открыть заявку, нажми «Открыть заявку» и отправь её ID.",
+        reply_markup=admin_menu(),
+    )
+
+
+@router.message(F.text == "⚙️ Состояние бота")
+async def admin_health_button(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await health(message)
+
+
+@router.message(F.text == "🔎 Открыть заявку")
+async def admin_review_button(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id):
+        return
+    await state.clear()
+    await state.set_state(AdminAction.clarification)
+    await state.update_data(admin_lookup_only=True)
+    await message.answer("Отправь ID заявки (минимум 8 символов). Для отмены напиши «Отмена».")
+
+
+@router.message(AdminAction.clarification, F.text)
+async def admin_lookup_order(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id):
+        return
+    data = await state.get_data()
+    if not data.get("admin_lookup_only"):
+        return
+    value = (message.text or "").strip()
+    if value.casefold() in {"отмена", "/cancel"}:
+        await state.clear()
+        await message.answer("Поиск отменён.", reply_markup=admin_menu())
+        return
+    await state.clear()
+    class _LookupMessage:
+        pass
+    await review_order(_LookupMessageWithText(message, f"/review {value}"))
+
+
+class _LookupMessageWithText:
+    def __init__(self, original: Message, text: str):
+        self._original = original
+        self.text = text
+        self.from_user = original.from_user
+        self.answer = original.answer
+        self.bot = original.bot
+        self.chat = original.chat
+
+@router.message(F.text == "👤 Режим клиента")
+async def admin_client_mode(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer("Клиентское меню включено. Для возврата к панели администратора напиши /start.", reply_markup=menu())
+
+
+@router.message(F.text == "💳 Оплаты")
+async def admin_payments_button(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer("Раздел оплат пока не подключён. Фиксация оплаты ещё не реализована.", reply_markup=admin_menu())
+
+
+@router.message(F.text == "📨 Напоминания")
+async def admin_reminders_button(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer("Раздел напоминаний пока не подключён. Автоматическая отправка напоминаний ещё не реализована.", reply_markup=admin_menu())
+
+
 @router.message(F.text == "Заказать карточку")
 async def begin(message: Message, state: FSMContext):
+    if admin_only(message.from_user.id):
+        await message.answer("Ты находишься в режиме администратора. Для оформления тестового заказа нажми «👤 Режим клиента».")
+        return
     await state.clear()
     await state.set_state(Brief.platform)
     await message.answer("Для какой площадки нужна карточка?", reply_markup=platform_menu())
