@@ -944,6 +944,9 @@ async def material_step(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "brief:confirm", Brief.confirmation)
 async def confirm_brief(call: CallbackQuery, state: FSMContext):
+    if call.from_user is None:
+        await call.answer("Не удалось определить пользователя.", show_alert=True)
+        return
     data = await state.get_data()
     async with Session() as db:
         client = await get_client(db, call.from_user)
@@ -967,8 +970,6 @@ async def confirm_brief(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("order:"))
 async def process_order_action(call: CallbackQuery, state: FSMContext):
     if not await require_admin_callback(call):
-        return
-        await call.answer("Это действие доступно только администратору.", show_alert=True)
         return
 
     try:
@@ -1229,8 +1230,6 @@ async def send_orders_list(message: Message, statuses: list[str] | None = None, 
 async def admin_open_order(call: CallbackQuery):
     if not await require_admin_callback(call):
         return
-        await call.answer("Доступ только администратору.", show_alert=True)
-        return
     order_id = call.data.split(":", 2)[2]
     found = await send_order_card(call.bot, call.message.chat.id, order_id)
     if found:
@@ -1331,6 +1330,13 @@ async def hermes_bridge_result(request: web.Request) -> web.Response:
             disable_web_page_preview=True,
         )
     return web.json_response({"ok": True})
+
+
+@router.message(Command("admin"))
+async def admin_help_command(message: Message):
+    if not await require_admin_message(message):
+        return
+    await message.answer("Команды владельца: /agent, /agent_status, /orders, /review ID, /generate ID, /quote ID СУММА, /paid ID СУММА, /deliver ID, /remind ID, /health, /price.")
 
 
 @router.message(Command("agent"))
@@ -1875,8 +1881,6 @@ async def generate_order_design(message: Message, state: FSMContext):
 async def process_design_action(call: CallbackQuery, state: FSMContext):
     if not await require_admin_callback(call):
         return
-        await call.answer("Только администратор может запускать генерацию и одобрять отправку.", show_alert=True)
-        return
     try:
         _, action, order_id = call.data.split(":", 2)
     except (AttributeError, ValueError):
@@ -2141,7 +2145,7 @@ async def create_assistant_order(message: Message):
 
 @router.message(F.forward_origin)
 async def collect_forward(message: Message):
-    if message.from_user.id != settings.admin_id:
+    if not await require_admin_message(message):
         return
     origin = message.forward_origin
     sender = getattr(origin, "sender_user", None)
@@ -2455,6 +2459,14 @@ async def remind(message: Message):
         await message.answer("Не удалось доставить напоминание клиенту.")
 
 
+@router.message(Command("cancel"))
+async def cancel_user_action(message: Message, state: FSMContext):
+    if message.from_user is None:
+        return
+    await state.clear()
+    await message.answer("Текущее действие отменено.", reply_markup=menu())
+
+
 @router.message(Command("stop"))
 async def stop(message: Message):
     async with Session() as db:
@@ -2578,6 +2590,12 @@ async def recover_interrupted_orders() -> list[str]:
         if rows:
             await db.commit()
     return recovered
+
+
+@router.message(F.text.startswith("/"))
+async def deny_unknown_commands(message: Message):
+    if message.from_user is None or not admin_only(message.from_user.id):
+        await message.answer("Эта команда не поддерживается. Используй кнопки клиентского меню.")
 
 
 async def main():
