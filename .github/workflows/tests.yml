@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: ["feat/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python sources
+        run: python -m compileall -q .
+      - name: Smoke-import bot without network or credentials
+        env:
+          BOT_TOKEN: "123456:test-token"
+          ADMIN_ID: "1"
+          DATABASE_URL: "sqlite+aiosqlite:///./ci-smoke.db"
+          STORAGE_PATH: "./ci-smoke-data"
+        run: python -c "import bot; from aiogram.fsm.storage.memory import SimpleEventIsolation"
+      - name: Run offline unit tests
+        run: python -m unittest discover -s tests -v
