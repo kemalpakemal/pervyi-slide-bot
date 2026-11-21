@@ -617,7 +617,7 @@ async def admin_stats(message: Message):
         "",
         "Период активности: последние 7 дней (UTC).",
     ]
-    await message.answer("\\n".join(lines), reply_markup=admin_menu())
+    await message.answer("\n".join(lines), reply_markup=admin_menu())
 
 
 @router.message(F.text == "📣 Рассылка")
