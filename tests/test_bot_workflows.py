@@ -190,7 +190,12 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as db:
             self.assertEqual(await db.scalar(bot.select(bot.func.count()).select_from(bot.HermesJob)), 0)
 
-        await bot.admin_hermes_agent(owner)
+        original_admin_id = bot.settings.admin_id
+        bot.settings.admin_id = 1
+        try:
+            await bot.admin_hermes_agent(owner)
+        finally:
+            bot.settings.admin_id = original_admin_id
         async with self.session_factory() as db:
             job = await db.scalar(bot.select(bot.HermesJob))
             self.assertIsNotNone(job)
