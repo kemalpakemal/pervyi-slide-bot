@@ -197,7 +197,7 @@ def make_watermarked_demo(
     step_y = max(75, rotated.height // 2)
     for y in range(-rotated.height, height + rotated.height, step_y):
         for x in range(-rotated.width, width + rotated.width, step_x):
-            overlay.alpha_composite(rotated, (x, y))
+            overlay.paste(rotated, (x, y), rotated)
 
     image = Image.alpha_composite(image, overlay)
     label_overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
