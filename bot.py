@@ -21,7 +21,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, ReplyKeyboardRemove, FSInputFile,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, delete, select, update
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, delete, select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -191,10 +191,22 @@ class Contact(StatesGroup):
     message = State()
 
 
+
 class AdminAction(StatesGroup):
     clarification = State()
     manual_images = State()
     lookup_order = State()
+    set_price = State()
+    broadcast = State()
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_id: Mapped[str] = mapped_column(ForeignKey("orders.id"), index=True)
+    amount: Mapped[int] = mapped_column(Integer)
+    note: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 router = Router()
@@ -210,9 +222,11 @@ def menu():
 def admin_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📥 Все заявки"), KeyboardButton(text="🕒 На проверке")],
-        [KeyboardButton(text="⚙️ Состояние бота"), KeyboardButton(text="🔎 Открыть заявку")],
-        [KeyboardButton(text="💳 Оплаты"), KeyboardButton(text="📨 Напоминания")],
-        [KeyboardButton(text="👤 Режим клиента")],
+        [KeyboardButton(text="🎨 На генерации"), KeyboardButton(text="👁 На согласовании")],
+        [KeyboardButton(text="💰 Оплаты"), KeyboardButton(text="👥 Клиенты")],
+        [KeyboardButton(text="🔎 Открыть заявку"), KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="📣 Рассылка"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="⚙️ Состояние бота"), KeyboardButton(text="👤 Режим клиента")],
     ], resize_keyboard=True)
 
 
@@ -402,6 +416,159 @@ async def admin_reminders_button(message: Message):
     if not admin_only(message.from_user.id):
         return
     await message.answer("Отправка напоминаний пока не реализована.", reply_markup=admin_menu())
+
+
+
+@router.message(F.text == "🎨 На генерации")
+async def admin_generating_orders(message: Message):
+    if not admin_only(message.from_user.id): return
+    await admin_list_status(message, ["accepted", "manual_pending", "generating"])
+
+
+@router.message(F.text == "👁 На согласовании")
+async def admin_reviewing_orders(message: Message):
+    if not admin_only(message.from_user.id): return
+    await admin_list_status(message, ["demo_review", "demo_sent"])
+
+
+async def admin_list_status(message: Message, statuses: list[str]):
+    async with Session() as db:
+        rows = list((await db.scalars(
+            select(Order).where(Order.status.in_(statuses))
+            .order_by(Order.created_at.desc()).limit(30)
+        )).all())
+    if not rows:
+        await message.answer("Заявок в этом разделе нет.", reply_markup=admin_menu())
+        return
+    await message.answer(
+        "\n".join(f"{x.id[:8]} · {x.status} · {x.source}" for x in rows) +
+        "\n\nОткрой нужную заявку через «🔎 Открыть заявку».",
+        reply_markup=admin_menu(),
+    )
+
+
+@router.message(F.text == "💰 Оплаты")
+async def admin_payment_menu(message: Message):
+    if not admin_only(message.from_user.id): return
+    async with Session() as db:
+        rows = list((await db.scalars(
+            select(Order).where(Order.status.in_(["paid", "completed", "demo_sent"]))
+            .order_by(Order.created_at.desc()).limit(20)
+        )).all())
+        payments = list((await db.scalars(select(Payment).order_by(Payment.created_at.desc()).limit(20))).all())
+    text = ["Последние подтверждения оплат:"]
+    if payments:
+        text += [f"{p.order_id[:8]} · {p.amount} RUB · {p.note or 'без комментария'}" for p in payments]
+    else:
+        text.append("Подтверждений пока нет.")
+    text.append("\nДля регистрации оплаты используй /paid ID СУММА [комментарий].")
+    await message.answer("\n".join(text), reply_markup=admin_menu())
+
+
+@router.message(F.text == "👥 Клиенты")
+async def admin_clients(message: Message):
+    if not admin_only(message.from_user.id): return
+    async with Session() as db:
+        clients = list((await db.scalars(select(Client).order_by(Client.created_at.desc()).limit(30))).all())
+        total = await db.scalar(select(func.count(Client.id)))
+    if not clients:
+        await message.answer("Клиентов пока нет.", reply_markup=admin_menu())
+        return
+    lines = [f"Клиентов в базе: {total}"]
+    lines += [f"{x.first_name or 'Без имени'} · @{x.username or 'нет username'} · ID {x.telegram_id}" for x in clients]
+    await message.answer("\n".join(lines), reply_markup=admin_menu())
+
+
+@router.message(F.text == "⚙️ Настройки")
+async def admin_settings(message: Message):
+    if not admin_only(message.from_user.id): return
+    await message.answer(
+        f"Режим генерации: {settings.image_mode}\nМодель: {settings.openai_image_model}\n"
+        f"Лимит слайдов: {settings.max_generation_slides}\nЛимит резерва на заявку: USD {settings.max_order_cost_usd:.2f}\n"
+        "Прайс хранится в config/price.yaml. Для изменения используй /price.",
+        reply_markup=admin_menu(),
+    )
+
+
+@router.message(F.text == "📊 Статистика")
+async def admin_stats(message: Message):
+    if not admin_only(message.from_user.id): return
+    async with Session() as db:
+        total_orders = await db.scalar(select(func.count(Order.id)))
+        total_clients = await db.scalar(select(func.count(Client.id)))
+        statuses = list((await db.execute(select(Order.status, func.count(Order.id)).group_by(Order.status))).all())
+    lines = [f"Клиентов: {total_clients or 0}", f"Заявок: {total_orders or 0}", "По статусам:"]
+    lines += [f"• {status}: {count}" for status, count in statuses]
+    await message.answer("\n".join(lines), reply_markup=admin_menu())
+
+
+@router.message(F.text == "📣 Рассылка")
+async def admin_broadcast_start(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id): return
+    await state.clear()
+    await state.set_state(AdminAction.broadcast)
+    await message.answer("Пришли текст рассылки. Для отмены напиши «Отмена». Сообщение отправится активным клиентам из базы.")
+
+
+@router.message(AdminAction.broadcast, F.text)
+async def admin_broadcast_send(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id): return
+    body = (message.text or "").strip()
+    if body.casefold() == "отмена":
+        await state.clear()
+        await message.answer("Рассылка отменена.", reply_markup=admin_menu())
+        return
+    await state.clear()
+    async with Session() as db:
+        ids = list((await db.scalars(select(Client.telegram_id).where(Client.stopped.is_(False)))).all())
+    sent = failed = 0
+    for telegram_id in ids:
+        try:
+            await message.bot.send_message(telegram_id, body)
+            sent += 1
+        except Exception:
+            failed += 1
+    await message.answer(f"Рассылка завершена. Успешно: {sent}; ошибок: {failed}.", reply_markup=admin_menu())
+
+
+@router.message(Command("price"))
+async def admin_price_command(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id): return
+    await state.clear()
+    await state.set_state(AdminAction.set_price)
+    await message.answer("Отправь новый прайс в формате: Название — сумма, по одной позиции на строку. Для отмены: Отмена.")
+
+
+@router.message(AdminAction.set_price, F.text)
+async def admin_price_save(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id): return
+    if (message.text or "").strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Изменение прайса отменено.", reply_markup=admin_menu())
+        return
+    items = []
+    for line in (message.text or "").splitlines():
+        if not line.strip(): continue
+        parts = re.split(r"\s*[—–-]\s*", line.strip(), maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("Не понял строку. Используй формат «Название — сумма».")
+            return
+        try: amount = int(parts[1].replace(" ", "").replace("₽", "").replace("руб.", ""))
+        except ValueError:
+            await message.answer(f"Некорректная сумма: {parts[1]}")
+            return
+        if amount < 0:
+            await message.answer("Сумма не может быть отрицательной.")
+            return
+        items.append({"name": parts[0][:100], "price": amount})
+    if not items:
+        await message.answer("Прайс пуст. Отправь хотя бы одну позицию.")
+        return
+    path = Path("config/price.yaml")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump({"currency": "RUB", "items": items}, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    await state.clear()
+    await message.answer(f"Прайс обновлён: {len(items)} позиций.", reply_markup=admin_menu())
 
 
 @router.message(F.text == "Заказать карточку")
@@ -1549,14 +1716,61 @@ async def collect_forward(message: Message):
 
 @router.message(Command("paid"))
 async def paid(message: Message):
-    if message.from_user.id == settings.admin_id:
-        await message.answer("Подтверждение оплаты будет добавлено на этапе 4. Сейчас оплата не подтверждается и оригиналы не выдаются.")
+    if not admin_only(message.from_user.id): return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Формат: /paid ID_ЗАЯВКИ СУММА [комментарий]")
+        return
+    prefix, raw_amount = parts[1], parts[2].split(maxsplit=1)[0]
+    note = parts[2][len(raw_amount):].strip() or None
+    try: amount = int(raw_amount.replace("₽", "").replace("руб.", ""))
+    except ValueError:
+        await message.answer("Сумма должна быть целым числом в рублях.")
+        return
+    if amount <= 0:
+        await message.answer("Сумма должна быть больше нуля.")
+        return
+    async with Session() as db:
+        matches = list((await db.scalars(select(Order).where(Order.id.like(f"{prefix}%")).limit(2))).all())
+        if len(matches) != 1:
+            await message.answer("Заявка не найдена или ID неоднозначен.")
+            return
+        order = matches[0]
+        order.status = "paid"
+        db.add(Payment(order_id=order.id, amount=amount, note=note))
+        await db.commit()
+        client = await db.get(Client, order.client_id)
+        client_id = client.telegram_id if client else None
+    await message.answer(f"Оплата зарегистрирована: заявка {order.id[:8]}, {amount} RUB.")
+    if client_id:
+        try: await message.bot.send_message(client_id, f"Оплата по заявке №{order.id[:8]} подтверждена.")
+        except Exception: pass
 
 
 @router.message(Command("remind"))
 async def remind(message: Message):
-    if message.from_user.id == settings.admin_id:
-        await message.answer("Напоминания будут добавлены на этапе 4. Сообщения клиентам автоматически не отправляются.")
+    if not admin_only(message.from_user.id): return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Формат: /remind ID_ЗАЯВКИ")
+        return
+    prefix = parts[1].strip()
+    async with Session() as db:
+        matches = list((await db.scalars(select(Order).where(Order.id.like(f"{prefix}%")).limit(2))).all())
+        if len(matches) != 1:
+            await message.answer("Заявка не найдена или ID неоднозначен.")
+            return
+        order = matches[0]
+        client = await db.get(Client, order.client_id)
+        client_id = client.telegram_id if client else None
+    if not client_id:
+        await message.answer("У заявки не найден клиент.")
+        return
+    try:
+        await message.bot.send_message(client_id, f"Напоминание по заявке №{order.id[:8]}. Напиши нам, если хочешь продолжить оформление.")
+        await message.answer(f"Напоминание отправлено клиенту по заявке {order.id[:8]}.")
+    except Exception:
+        await message.answer("Не удалось доставить напоминание клиенту.")
 
 
 @router.message(Command("stop"))
