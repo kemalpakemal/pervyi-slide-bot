@@ -518,7 +518,7 @@ async def admin_reminders_button(message: Message):
         return
     active_statuses = [
         "admin_review", "waiting_client_info", "accepted", "manual_pending",
-        "generating", "demo_review", "demo_sent", "paid_delivery_pending",
+        "generating", "demo_review", "demo_sent", "awaiting_payment", "paid_delivery_pending",
     ]
     async with Session() as db:
         rows = list((await db.scalars(
@@ -539,7 +539,8 @@ async def admin_reminders_button(message: Message):
         "manual_pending": "нужна ручная обработка",
         "generating": "генерируется",
         "demo_review": "демо на согласовании",
-        "demo_sent": "ожидает ответа/оплаты",
+        "demo_sent": "ожидает согласования цены",
+        "awaiting_payment": "ожидает оплаты",
         "paid_delivery_pending": "оплачена, выдача ожидает",
     }
     lines = ["Заявки, по которым можно связаться с клиентом:", ""]
@@ -577,16 +578,43 @@ async def admin_payment_menu(message: Message):
     if not admin_only(message.from_user.id): return
     async with Session() as db:
         rows = list((await db.scalars(
-            select(Order).where(Order.status.in_(["paid", "completed", "demo_sent"]))
+            select(Order).where(Order.status.in_(["awaiting_payment", "paid", "paid_delivery_pending", "completed"]))
             .order_by(Order.created_at.desc()).limit(20)
         )).all())
         payments = list((await db.scalars(select(Payment).order_by(Payment.created_at.desc()).limit(20))).all())
-    text = ["Последние подтверждения оплат:"]
-    if payments:
-        text += [f"{p.order_id[:8]} · {p.amount} RUB · {p.note or 'без комментария'}" for p in payments]
+        pending_quotes = list((await db.scalars(
+            select(Order).where(Order.status == "awaiting_payment")
+            .order_by(Order.created_at.desc()).limit(15)
+        )).all())
+        pending_clients = {
+            row.id: await db.get(Client, row.client_id)
+            for row in pending_quotes
+        }
+    text = ["ОЖИДАЮТ ОПЛАТЫ:"]
+    if pending_quotes:
+        for order in pending_quotes:
+            brief = dict(order.brief or {})
+            client = pending_clients.get(order.id)
+            client_name = (
+                f"@{client.username}" if client and client.username
+                else (client.first_name if client and client.first_name else "клиент")
+            )
+            amount = brief.get("agreed_price_rub")
+            price_text = f"{int(amount)} ₽" if amount is not None else "цена не указана"
+            text.append(f"{order.id[:8]} · {client_name} · {price_text}")
     else:
-        text.append("Подтверждений пока нет.")
-    text.append("\nДля регистрации оплаты используй /paid ID СУММА [комментарий].")
+        text.append("Нет счетов, ожидающих оплаты.")
+    text.append("\nПОСЛЕДНИЕ ОПЛАТЫ:")
+    if payments:
+        text += [f"{p.order_id[:8]} · {p.amount} ₽ · {p.note or 'без комментария'}" for p in payments]
+    else:
+        text.append("Подтверждённых оплат пока нет.")
+    text += [
+        "",
+        "Согласовать цену и отправить клиенту: /quote ID СУММА [комментарий]",
+        "Подтвердить полную оплату и выдать оригиналы: /paid ID СУММА [комментарий]",
+        "Повторить незавершённую выдачу: /deliver ID",
+    ]
     await message.answer("\n".join(text), reply_markup=admin_menu())
 
 
@@ -2114,7 +2142,7 @@ async def _update_original_delivery(
         await db.commit()
 
 
-async def deliver_paid_originals(bot: Bot, order_id: str) -> tuple[bool, str]:
+async def _deliver_paid_originals_locked(bot: Bot, order_id: str) -> tuple[bool, str]:
     """Deliver unwatermarked files only after an admin-recorded payment."""
     async with Session() as db:
         order = await db.get(Order, order_id)
@@ -2199,6 +2227,79 @@ async def deliver_paid_originals(bot: Bot, order_id: str) -> tuple[bool, str]:
     return True, f"Оригиналы выданы клиенту. Всего файлов: {len(files)}."
 
 
+_original_delivery_lock = asyncio.Lock()
+
+
+async def deliver_paid_originals(bot: Bot, order_id: str) -> tuple[bool, str]:
+    # Prevent duplicate delivery when two admin commands arrive together.
+    async with _original_delivery_lock:
+        return await _deliver_paid_originals_locked(bot, order_id)
+
+
+@router.message(Command("quote"))
+async def quote_order(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Формат: /quote ID_ЗАЯВКИ СУММА [комментарий].")
+        return
+    prefix = parts[1].strip()
+    amount_token = parts[2].split(maxsplit=1)[0].replace("₽", "").replace("руб.", "")
+    note = parts[2][len(parts[2].split(maxsplit=1)[0]):].strip() or None
+    try:
+        amount = int(amount_token)
+    except ValueError:
+        await message.answer("Сумма должна быть целым числом в рублях без пробелов, например 1500.")
+        return
+    if amount <= 0:
+        await message.answer("Сумма должна быть больше нуля.")
+        return
+
+    async with Session() as db:
+        matches = list((await db.scalars(
+            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
+        )).all())
+        if len(matches) != 1:
+            await message.answer("Заявка не найдена или ID неоднозначен.")
+            return
+        order = matches[0]
+        if order.status not in {"demo_sent", "awaiting_payment"}:
+            await message.answer(
+                f"Согласовать цену можно после отправки демо. Текущий статус: {order.status}."
+            )
+            return
+        client = await db.get(Client, order.client_id)
+        client_id = client.telegram_id if client else None
+        if not client_id:
+            await message.answer("Не найден Telegram-клиент этой заявки.")
+            return
+        brief = dict(order.brief or {})
+        brief["agreed_price_rub"] = amount
+        brief["quote_note"] = note
+        brief["quote_created_at"] = now().isoformat()
+        order.brief = brief
+        order.status = "awaiting_payment"
+        await db.commit()
+        order_id = order.id
+
+    text = (
+        f"Стоимость заказа №{order_id[:8]}: {amount} ₽.\\n"
+        "После подтверждения оплаты студия отправит оригиналы изображений без водяного знака."
+    )
+    if note:
+        text += f"\\nКомментарий: {note}"
+    try:
+        await message.bot.send_message(client_id, text)
+    except Exception:
+        await message.answer(
+            f"Цена сохранена для заявки {order_id[:8]}, но сообщение клиенту не доставлено. "
+            "Проверь, что клиент открыл чат с ботом."
+        )
+        return
+    await message.answer(f"Цена {amount} ₽ сохранена и отправлена клиенту по заявке {order_id[:8]}.")
+
+
 @router.message(Command("paid"))
 async def paid(message: Message):
     if not admin_only(message.from_user.id):
@@ -2226,9 +2327,19 @@ async def paid(message: Message):
             await message.answer("Заявка не найдена или ID неоднозначен.")
             return
         order = matches[0]
-        if order.status != "demo_sent":
+        if order.status != "awaiting_payment":
             await message.answer(
-                f"Оплату можно подтвердить после отправки демо клиенту. Текущий статус: {order.status}."
+                f"Сначала согласуй стоимость командой /quote. Текущий статус: {order.status}."
+            )
+            return
+        agreed_price = int((order.brief or {}).get("agreed_price_rub") or 0)
+        if agreed_price <= 0:
+            await message.answer("Для этой заявки не сохранена согласованная стоимость. Используй /quote ID СУММА.")
+            return
+        if amount != agreed_price:
+            await message.answer(
+                f"Сумма не совпадает с согласованной стоимостью: {agreed_price} ₽. "
+                "При необходимости сначала обнови цену через /quote."
             )
             return
         order.status = "paid"
