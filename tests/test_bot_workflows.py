@@ -191,11 +191,14 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await db.scalar(bot.select(bot.func.count()).select_from(bot.HermesJob)), 0)
 
         original_admin_id = bot.settings.admin_id
+        original_bridge_token = bot.settings.hermes_bridge_token
         bot.settings.admin_id = 1
+        bot.settings.hermes_bridge_token = "test-bridge-token"
         try:
             await bot.admin_hermes_agent(owner)
         finally:
             bot.settings.admin_id = original_admin_id
+            bot.settings.hermes_bridge_token = original_bridge_token
         async with self.session_factory() as db:
             job = await db.scalar(bot.select(bot.HermesJob))
             self.assertIsNotNone(job)
