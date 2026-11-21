@@ -194,6 +194,7 @@ class Contact(StatesGroup):
 class AdminAction(StatesGroup):
     clarification = State()
     manual_images = State()
+    lookup_order = State()
 
 
 router = Router()
@@ -365,17 +366,13 @@ async def admin_review_button(message: Message, state: FSMContext):
     if not admin_only(message.from_user.id):
         return
     await state.clear()
-    await state.set_state(AdminAction.clarification)
-    await state.update_data(admin_lookup_only=True)
+    await state.set_state(AdminAction.lookup_order)
     await message.answer("Отправь ID заявки (минимум 8 символов). Для отмены напиши «Отмена».")
 
 
-@router.message(AdminAction.clarification, F.text)
+@router.message(AdminAction.lookup_order, F.text)
 async def admin_lookup_order(message: Message, state: FSMContext):
     if not admin_only(message.from_user.id):
-        return
-    data = await state.get_data()
-    if not data.get("admin_lookup_only"):
         return
     value = (message.text or "").strip()
     if value.casefold() in {"отмена", "/cancel"}:
@@ -383,39 +380,7 @@ async def admin_lookup_order(message: Message, state: FSMContext):
         await message.answer("Поиск отменён.", reply_markup=admin_menu())
         return
     await state.clear()
-    class _LookupMessage:
-        pass
-    await review_order(_LookupMessageWithText(message, f"/review {value}"))
-
-
-class _LookupMessageWithText:
-    def __init__(self, original: Message, text: str):
-        self._original = original
-        self.text = text
-        self.from_user = original.from_user
-        self.answer = original.answer
-        self.bot = original.bot
-        self.chat = original.chat
-
-@router.message(F.text == "👤 Режим клиента")
-async def admin_client_mode(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer("Клиентское меню включено. Для возврата к панели администратора напиши /start.", reply_markup=menu())
-
-
-@router.message(F.text == "💳 Оплаты")
-async def admin_payments_button(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer("Раздел оплат пока не подключён. Фиксация оплаты ещё не реализована.", reply_markup=admin_menu())
-
-
-@router.message(F.text == "📨 Напоминания")
-async def admin_reminders_button(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    await message.answer("Раздел напоминаний пока не подключён. Автоматическая отправка напоминаний ещё не реализована.", reply_markup=admin_menu())
+    await review_order(message, f"/review {value}")
 
 
 @router.message(F.text == "Заказать карточку")
@@ -775,10 +740,10 @@ async def orders(message: Message):
 
 
 @router.message(Command("review"))
-async def review_order(message: Message):
+async def review_order(message: Message, command_text: str | None = None):
     if message.from_user.id != settings.admin_id:
         return
-    parts = (message.text or "").split(maxsplit=1)
+    parts = (command_text or message.text or "").split(maxsplit=1)
     prefix = parts[1].strip() if len(parts) > 1 else ""
     async with Session() as db:
         if prefix:
