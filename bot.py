@@ -18,11 +18,17 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove, FSInputFile,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, delete, select
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from image_pipeline import ImagePipelineError, make_watermarked_demo
+from image_generation import (
+    GenerationError,
+    build_slide_prompts,
+    generate_slide_image,
+    save_generated_image,
+)
 
 
 class Settings(BaseSettings):
@@ -34,6 +40,14 @@ class Settings(BaseSettings):
     max_files_per_order: int = 12
     demo_long_edge: int = 700
     demo_watermark_text: str = "ПЕРВЫЙ СЛАЙД • ДЕМО"
+    # Автономная генерация
+    image_provider: str = "openai"
+    openai_api_key: str | None = None
+    openai_image_model: str = "gpt-image-1"
+    auto_generate_on_accept: bool = True
+    # Оплата и реквизиты (заполняются в Railway Variables)
+    payment_requisites: str = ""
+    payment_link: str = ""
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
@@ -215,8 +229,239 @@ def order_action_menu(order_id: str):
 
 def generate_order_menu(order_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Как передать готовое демо", callback_data=f"manual-demo-help:{order_id}")]
+        [InlineKeyboardButton(text="Авто-генерация слайдов", callback_data=f"design:auto:{order_id}")],
+        [InlineKeyboardButton(text="Ручная загрузка из ChatGPT", callback_data=f"design:upload:{order_id}")],
     ])
+
+
+def payment_text(order_id: str, slides: int) -> str:
+    lines = [f"Заявка №{order_id[:8]}: стоимость и сроки уточняются отдельно."]
+    if settings.payment_link:
+        lines.append(f"Оплата: {settings.payment_link}")
+    if settings.payment_requisites:
+        lines.append(f"Реквизиты: {settings.payment_requisites}")
+    if not settings.payment_link and not settings.payment_requisites:
+        lines.append("Реквизиты уточни у администратора.")
+    lines.append("Оригиналы выдаются после подтверждения оплаты администратором.")
+    return "\n".join(lines)
+
+
+def feedback_menu(order_id: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Понравилось", callback_data=f"feedback:like:{order_id}")],
+        [InlineKeyboardButton(text="Нужны правки", callback_data=f"feedback:revise:{order_id}")],
+        [InlineKeyboardButton(text="Я оплатил", callback_data=f"feedback:paid:{order_id}")],
+    ])
+
+
+async def _download_first_product_photo(bot: Bot, order_id: str) -> Path | None:
+    """Скачивает первое фото товара клиента как референс для генерации."""
+    async with Session() as db:
+        files = list((await db.scalars(
+            select(OrderFile).where(OrderFile.order_id == order_id).limit(1)
+        )).all())
+    if not files:
+        return None
+    try:
+        tg_file = await bot.get_file(files[0].telegram_file_id)
+        dest = settings.storage_path / "orders" / order_id / "ref_product.jpg"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await bot.download_file(tg_file.file_path, destination=dest)
+        from PIL import Image
+        with Image.open(dest) as img:
+            img.convert("RGB").save(dest, "JPEG")
+        return dest
+    except Exception as exc:
+        raise GenerationError("Не удалось скачать или открыть фото товара") from exc
+
+
+async def auto_generate_for_order(bot: Bot, order_id: str) -> bool:
+    """Полностью автономная генерация: создаёт слайды, делает демо, шлёт админу на проверку."""
+    async with Session() as db:
+        result = await db.execute(update(Order).where(
+            Order.id == order_id, Order.status == "accepted"
+        ).values(status="generating"))
+        if result.rowcount != 1:
+            await db.rollback()
+            return False
+        await db.commit()
+        order = await db.get(Order, order_id)
+        brief = dict(order.brief or {})
+
+    try:
+        await bot.send_message(settings.admin_id, f"Авто-генерация запущена для заявки {order_id[:8]}. Генерирую слайды...")
+    except Exception:
+        pass
+
+    prompts = build_slide_prompts(brief)
+    platform = brief.get("platform")
+    try:
+        ref_photo = await _download_first_product_photo(bot, order_id)
+    except GenerationError as exc:
+        async with Session() as db:
+            order = await db.get(Order, order_id)
+            if order and order.status == "generating":
+                order.status = "generation_failed"
+                await db.commit()
+        await bot.send_message(settings.admin_id, f"Заявка {order_id[:8]}: {exc}. Повтори через /generate {order_id[:8]}.")
+        return False
+    order_dir = settings.storage_path / "orders" / order_id
+    order_dir.mkdir(parents=True, exist_ok=True)
+
+    assets: list[dict] = []
+    errors: list[str] = []
+    for idx, prompt in enumerate(prompts, start=1):
+        try:
+            image_bytes = await generate_slide_image(
+                prompt=prompt,
+                platform=platform,
+                provider=settings.image_provider,
+                openai_api_key=settings.openai_api_key,
+                openai_model=settings.openai_image_model,
+                reference_image=ref_photo,
+                seed=random_seed(order_id, idx),
+            )
+            final_path = order_dir / f"auto_final_{idx:02d}.png"
+            demo_path = order_dir / f"auto_demo_{idx:02d}.jpg"
+            save_generated_image(image_bytes, final_path)
+            await asyncio.to_thread(
+                make_watermarked_demo, final_path, demo_path,
+                settings.demo_long_edge, settings.demo_watermark_text,
+            )
+            assets.append({
+                "slide": idx,
+                "final_path": str(final_path),
+                "demo_path": str(demo_path),
+                "source": "auto",
+                "prompt": prompt[:500],
+            })
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Слайд {idx}: {type(exc).__name__}: {str(exc)[:250]}")
+            break
+
+    if errors or len(assets) != len(prompts):
+        async with Session() as db:
+            order = await db.get(Order, order_id)
+            if order:
+                order.status = "generation_failed"
+                b = dict(order.brief or {})
+                b["generation_error"] = "; ".join(errors)[:2000]
+                order.brief = b
+                await db.commit()
+        try:
+            await bot.send_message(
+                settings.admin_id,
+                f"Авто-генерация для заявки {order_id[:8]} не удалась.\n"
+                + "\n".join(errors)
+                + "\n\nПроверь настройки API и повтори через /generate <ID>.",
+                reply_markup=design_upload_menu(order_id),
+            )
+        except Exception:
+            pass
+        return False
+
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None:
+            return False
+        b = dict(order.brief or {})
+        b["design_assets"] = assets
+        b["generation"] = {"finished_at": now().isoformat(), "slides": len(assets), "errors": errors}
+        order.brief = b
+        order.status = "demo_review"
+        await db.commit()
+
+    # Отправка админу на проверку
+    try:
+        await bot.send_message(
+            settings.admin_id,
+            f"Демо готово по заявке {order_id[:8]} ({len(assets)} слайд(ов)). Отправляю клиенту автоматически; проверь качество.",
+        )
+        for asset in assets:
+            demo_path = Path(asset["demo_path"])
+            if demo_path.is_file():
+                await bot.send_photo(
+                    settings.admin_id, FSInputFile(demo_path),
+                    caption=f"Авто-демо · заявка {order_id[:8]} · слайд {asset['slide']}",
+                )
+    except Exception:
+        pass
+    if not await send_demo_to_client(bot, order_id):
+        try:
+            await bot.send_message(settings.admin_id, f"Не удалось отправить демо клиенту по заявке {order_id[:8]}. Повтори через /review {order_id[:8]}.")
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def random_seed(order_id: str, slide: int) -> int:
+    import hashlib
+    h = int(hashlib.md5(f"{order_id}:{slide}".encode()).hexdigest()[:8], 16)
+    return h % 999999 + 1
+
+
+async def send_demo_to_client(bot: Bot, order_id: str) -> bool:
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None or order.status != "demo_review":
+            return False
+        brief = dict(order.brief or {})
+        assets = brief.get("design_assets", [])
+        client = await db.get(Client, order.client_id)
+        client_tg = client.telegram_id if client else None
+        slides = brief.get("slides") or len(assets)
+    if not client_tg or not assets:
+        return False
+    try:
+        await bot.send_message(
+            client_tg,
+            f"Готово демо по заявке №{order_id[:8]}. Это предварительные изображения с водяным знаком.\n"
+            "Посмотри их и нажми кнопку ниже.",
+            reply_markup=feedback_menu(order_id),
+        )
+        for asset in assets:
+            demo_path = Path(asset.get("demo_path", ""))
+            if not demo_path.is_file():
+                raise ImagePipelineError("Демо-файл отсутствует")
+            await bot.send_photo(client_tg, FSInputFile(demo_path), caption=f"Демо · слайд {asset.get('slide')}")
+        await bot.send_message(client_tg, payment_text(order_id, int(slides or len(assets))))
+    except Exception:
+        return False
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order and order.status == "demo_review":
+            order.status = "demo_sent"
+            await db.commit()
+    return True
+
+
+async def send_originals_to_client(bot: Bot, order_id: str) -> bool:
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None:
+            return False
+        brief = dict(order.brief or {})
+        assets = brief.get("design_assets", [])
+        client = await db.get(Client, order.client_id)
+        client_tg = client.telegram_id if client else None
+    if not client_tg or not assets:
+        return False
+    try:
+        await bot.send_message(client_tg, f"Оплата подтверждена по заявке №{order_id[:8]}. Отправляю чистые оригиналы без водяного знака.")
+        for asset in assets:
+            final_path = Path(asset.get("final_path", ""))
+            if not final_path.is_file():
+                raise ImagePipelineError("Файл оригинала отсутствует")
+            await bot.send_document(client_tg, FSInputFile(final_path), caption=f"Оригинал · слайд {asset.get('slide')}")
+    except Exception:
+        return False
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order:
+            order.status = "delivered"
+            await db.commit()
+    return True
 
 
 async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
@@ -433,7 +678,7 @@ async def confirm_brief(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     async with Session() as db:
         client = await get_client(db, call.from_user)
-        order = Order(client_id=client.id, status="admin_review", source="bot",
+        order = Order(client_id=client.id, status="accepted", source="bot",
                       brief={k: v for k, v in data.items() if k not in {"files", "summary"}})
         db.add(order)
         await db.flush()
@@ -443,9 +688,13 @@ async def confirm_brief(call: CallbackQuery, state: FSMContext):
         await db.commit()
         order_id = order.id
     await state.clear()
-    await call.message.edit_text(f"Бриф принят. Номер заявки: {order_id[:8]}. Администратор проверит материалы и свяжется с тобой.")
+    await call.message.edit_text(f"Бриф принят. Номер заявки: {order_id[:8]}. Начинаю подготовку демо.")
     await call.answer()
-    await send_order_card(call.bot, settings.admin_id, order_id)
+    asyncio.create_task(auto_generate_for_order(call.bot, order_id))
+    try:
+        await send_order_card(call.bot, settings.admin_id, order_id)
+    except Exception:
+        pass
 
 
 
@@ -498,18 +747,19 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
     await call.message.edit_reply_markup(reply_markup=None)
     if action == "accept":
         client_message = (
-            f"Заявка №{order_id[:8]} принята администратором. "
-            "Сейчас проверяются материалы и условия заказа. "
-            "Стоимость и сроки будут отдельно согласованы. Пока ничего оплачивать не нужно."
+            f"Заявка №{order_id[:8]} принята. "
+            "Автоматически генерирую карточки по вашему брифу. "
+            "Как только демо будет готово, пришлю его на проверку."
         )
-        await call.answer("Заявка принята.")
+        await call.answer("Заявка принята. Запускаю авто-генерацию.")
         await call.message.answer(
-            f"Заявка {order_id[:8]} принята.\n\n"
-            "Создай слайд во встроенном генераторе изображений ChatGPT по брифу и фото товара. "
-            "Вернись сюда и нажми кнопку ниже — бот примет готовый файл, сохранит оригинал "
-            "и сделает демо с водяным знаком.",
+            f"Заявка {order_id[:8]} принята. Авто-генерация запущена в фоне.\n"
+            "Бот сам создаст слайды, сделает демо с водяным знаком и пришлёт тебе на проверку.\n"
+            "Если авто-генерация недоступна — используй ручную загрузку.",
             reply_markup=design_upload_menu(order_id),
         )
+        if settings.auto_generate_on_accept:
+            asyncio.create_task(auto_generate_for_order(call.bot, order_id))
     else:
         client_message = (
             f"К сожалению, студия пока не может принять заявку №{order_id[:8]}. "
@@ -687,14 +937,23 @@ async def review_order(message: Message):
                 return
     if order.status == "accepted":
         await message.answer(
-            f"Заявка {order.id[:8]} уже принята. Нажми кнопку, чтобы загрузить готовое изображение из ChatGPT.",
+            f"Заявка {order.id[:8]} уже принята. Запусти авто-генерацию или загрузи вручную.",
             reply_markup=design_upload_menu(order.id),
         )
         return
+    if order.status == "generating":
+        await message.answer(f"Заявка {order.id[:8]} сейчас генерируется. Подожди, демо придёт автоматически.")
+        return
     if order.status == "demo_review":
         await message.answer(
-            f"По заявке {order.id[:8]} уже есть демо. Можно добавить следующий слайд или отправить все демо клиенту.",
+            f"По заявке {order.id[:8]} уже есть демо. Проверь и отправь клиенту или перегенерируй.",
             reply_markup=design_review_menu(order.id),
+        )
+        return
+    if order.status == "demo_sent":
+        await message.answer(
+            f"Заявка {order.id[:8]}: демо отправлено клиенту, ждём отзыв/оплату. "
+            "Подтвердить оплату: /paid <ID>",
         )
         return
     if order.status != "admin_review":
@@ -707,14 +966,16 @@ async def review_order(message: Message):
 
 def design_upload_menu(order_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Загрузить изображения из ChatGPT", callback_data=f"design:upload:{order_id}")]
+        [InlineKeyboardButton(text="Авто-генерация слайдов", callback_data=f"design:auto:{order_id}")],
+        [InlineKeyboardButton(text="Ручная загрузка из ChatGPT", callback_data=f"design:upload:{order_id}")],
     ])
 
 
 def design_review_menu(order_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Добавить следующий слайд", callback_data=f"design:upload:{order_id}")],
         [InlineKeyboardButton(text="Отправить демо клиенту", callback_data=f"design:send:{order_id}")],
+        [InlineKeyboardButton(text="Перегенерировать авто", callback_data=f"design:regen:{order_id}")],
+        [InlineKeyboardButton(text="Добавить вручную", callback_data=f"design:upload:{order_id}")],
     ])
 
 
@@ -731,11 +992,31 @@ def parse_benefits(value) -> list[str]:
 async def generate_order_design(message: Message):
     if message.from_user.id != settings.admin_id:
         return
-    await message.answer(
-        "Автогенерация через OctavApi отключена из-за повторяющейся ошибки 502/5002. "
-        "Создай изображение в ChatGPT, поделись им с @pervy_slide_bot, "
-        "затем ответь на фото командой /demo ID заявки."
-    )
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or len(parts[1].strip()) < 8:
+        await message.answer("Укажи ID заявки: /generate <ID>. Например: /generate 2c19e81f")
+        return
+    prefix = parts[1].strip()
+    async with Session() as db:
+        matches = list((await db.scalars(
+            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
+        )).all())
+    if not matches:
+        await message.answer("Заявка не найдена.")
+        return
+    if len(matches) > 1:
+        await message.answer("Несколько заявок. Укажи больше символов ID.")
+        return
+    order = matches[0]
+    if order.status not in {"accepted", "generation_failed"}:
+        await message.answer(f"Нельзя генерировать в статусе {order.status}. Сначала прими заявку.")
+        return
+    if order.status == "generation_failed":
+        async with Session() as db:
+            await db.execute(update(Order).where(Order.id == order.id, Order.status == "generation_failed").values(status="accepted"))
+            await db.commit()
+    await message.answer(f"Запускаю авто-генерацию для заявки {order.id[:8]}...")
+    asyncio.create_task(auto_generate_for_order(message.bot, order.id))
 
 
 @router.callback_query(F.data.startswith("design:"))
@@ -774,6 +1055,20 @@ async def process_design_action(call: CallbackQuery, state: FSMContext):
             )
             return
 
+        if action in {"auto", "regen"}:
+            if order.status not in {"accepted", "demo_review"}:
+                await call.answer(f"Нельзя генерировать в статусе {order.status}.", show_alert=True)
+                return
+            if action == "regen":
+                brief.pop("design_assets", None)
+                order.brief = brief
+                order.status = "accepted"
+                await db.commit()
+            await call.answer("Запускаю авто-генерацию...")
+            await call.message.edit_reply_markup(reply_markup=None)
+            asyncio.create_task(auto_generate_for_order(call.bot, order_id))
+            return
+
         if action == "again":
             if order.status != "demo_review":
                 await call.answer(f"Нельзя перегенерировать в статусе {order.status}.", show_alert=True)
@@ -793,45 +1088,17 @@ async def process_design_action(call: CallbackQuery, state: FSMContext):
         if order.status != "demo_review" or not assets:
             await call.answer("Демо ещё не подготовлено или уже отправлено.", show_alert=True)
             return
-        client = await db.get(Client, order.client_id)
-        client_telegram_id = client.telegram_id if client else None
 
-    if not client_telegram_id:
-        await call.answer("Не найден Telegram ID клиента.", show_alert=True)
-        return
-
-    try:
-        await call.bot.send_message(
-            client_telegram_id,
-            f"Готово демо по заявке №{order_id[:8]}. Это предварительные изображения с водяным знаком. "
-            "Посмотри их и напиши, что нужно поправить. Чистые оригиналы выдаются после согласования и оплаты."
-        )
-        for asset in assets:
-            demo_path = Path(asset.get("demo_path", ""))
-            if not demo_path.is_file():
-                raise ImagePipelineError(f"Не найден демо-файл слайда {asset.get('slide')}.")
-            await call.bot.send_photo(
-                client_telegram_id,
-                FSInputFile(demo_path),
-                caption=f"Демо · слайд {asset.get('slide')}",
-            )
-    except Exception as exc:
+    ok = await send_demo_to_client(call.bot, order_id)
+    if not ok:
         await call.message.answer(
-            "Не получилось отправить демо клиенту. Проверь, что он не заблокировал бота. "
-            f"Ошибка: {type(exc).__name__}."
+            "Не получилось отправить демо клиенту. Проверь, что он не заблокировал бота."
         )
         await call.answer("Отправка не удалась.", show_alert=True)
         return
-
-    async with Session() as db:
-        order = await db.get(Order, order_id)
-        if order and order.status == "demo_review":
-            order.status = "demo_sent"
-            await db.commit()
-
     await call.message.edit_reply_markup(reply_markup=None)
     await call.answer("Демо отправлено клиенту.")
-    await call.message.answer(f"Демо по заявке {order_id[:8]} отправлено. Оригиналы остаются в закрытом хранилище.")
+    await call.message.answer(f"Демо по заявке {order_id[:8]} отправлено клиенту вместе с реквизитами и кнопками отзыва. Оригиналы в закрытом хранилище.")
 
 
 
@@ -844,12 +1111,64 @@ async def manual_demo_help(call: CallbackQuery):
     order_id = call.data.split(":", 1)[1]
     await call.answer()
     await call.message.answer(
-        "Порядок передачи готового изображения из ChatGPT:\n"
+        "Ручной режим (если авто-генерация недоступна):\n"
         "1. Создай макет в ChatGPT по брифу и фото товара.\n"
         "2. Нажми «Поделиться» → Telegram → @pervy_slide_bot.\n"
         f"3. Ответь на фото командой /demo {order_id[:8]}.\n"
-        "Бот сохранит оригинал, наложит водяной знак и покажет кнопку отправки демо заказчику."
+        "Бот сохранит оригинал, наложит водяной знак и покажет кнопку отправки демо заказчику.\n\n"
+        "Авто-режим: кнопка «Авто-генерация слайдов» или /generate <ID> — без ручных шагов."
     )
+
+
+@router.callback_query(F.data.startswith("feedback:"))
+async def process_feedback(call: CallbackQuery):
+    try:
+        _, action, order_id = call.data.split(":", 2)
+    except (AttributeError, ValueError):
+        await call.answer("Некорректное действие.", show_alert=True)
+        return
+    async with Session() as db:
+        order = await db.get(Order, order_id)
+        if order is None:
+            await call.answer("Заявка не найдена.", show_alert=True)
+            return
+        client = await db.get(Client, order.client_id)
+        if client is None or client.telegram_id != call.from_user.id:
+            await call.answer("Это не ваша заявка.", show_alert=True)
+            return
+        if order.status != "demo_sent" or action not in {"like", "revise", "paid"}:
+            await call.answer("Действие недоступно для этой заявки.", show_alert=True)
+            return
+        brief = dict(order.brief or {})
+        brief.setdefault("feedback", {})[action] = now().isoformat()
+        order.brief = brief
+        if action == "revise":
+            order.status = "waiting_revision"
+        await db.commit()
+
+    if action == "like":
+        await call.message.answer("Спасибо за отзыв! Если всё устраивает — оплатите по реквизитам выше, и я отправлю чистые оригиналы.")
+        await call.answer("Спасибо!")
+        try:
+            await call.bot.send_message(settings.admin_id, f"Клиент одобрил демо по заявке {order_id[:8]}. Ждём оплату.")
+        except Exception:
+            pass
+    elif action == "revise":
+        await call.message.answer("Понял, нужны правки. Напиши следующим сообщением, что поправить — я запущу новую генерацию.")
+        await call.answer("Принято, жду описание правок.")
+        try:
+            await call.bot.send_message(settings.admin_id, f"Клиент попросил правки по заявке {order_id[:8]}. Жду описание.")
+        except Exception:
+            pass
+    elif action == "paid":
+        await call.message.answer("Спасибо! Администратор проверит оплату и отправит оригиналы.")
+        await call.answer("Передано администратору.")
+        try:
+            await call.bot.send_message(settings.admin_id, f"Клиент нажал «Я оплатил» по заявке {order_id[:8]}. Проверь и подтверди: /paid {order_id[:8]}")
+        except Exception:
+            pass
+    else:
+        await call.answer("Неизвестное действие.", show_alert=True)
 
 
 async def save_manual_design_image(message: Message, order_id: str, source_message: Message) -> bool:
@@ -1067,8 +1386,23 @@ async def collect_forward(message: Message):
 
 @router.message(Command("paid"))
 async def paid(message: Message):
-    if message.from_user.id == settings.admin_id:
-        await message.answer("Подтверждение оплаты будет добавлено на этапе 4. Сейчас оплата не подтверждается и оригиналы не выдаются.")
+    if message.from_user.id != settings.admin_id:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or len(parts[1].strip()) < 8:
+        await message.answer("Укажи ID: /paid <ID>. Подтверждай только после проверки поступления оплаты.")
+        return
+    prefix = parts[1].strip()
+    async with Session() as db:
+        orders = list((await db.scalars(select(Order).where(Order.id.like(f"{prefix}%")).limit(2))).all())
+        if len(orders) != 1 or orders[0].status != "demo_sent":
+            await message.answer("Заявка не найдена, ID неоднозначен или демо ещё не отправлено.")
+            return
+        order_id = orders[0].id
+    if await send_originals_to_client(message.bot, order_id):
+        await message.answer("Оплата подтверждена, оригиналы отправлены.")
+    else:
+        await message.answer("Не удалось отправить оригиналы. Проверь файлы и доступность клиента.")
 
 
 @router.message(Command("remind"))
@@ -1110,19 +1444,26 @@ async def forward_client_clarification(message: Message):
             return
         order = await db.scalar(
             select(Order)
-            .where(Order.client_id == client.id, Order.status == "waiting_client_info")
+            .where(Order.client_id == client.id, Order.status.in_(["waiting_client_info", "waiting_revision"]))
             .order_by(Order.created_at.desc())
             .limit(1)
         )
         if order is None:
             return
         order_id = order.id
+        is_revision = order.status == "waiting_revision"
+        if is_revision:
+            brief = dict(order.brief or {})
+            brief["style"] = str(brief.get("style") or "") + "\nПравки клиента: " + message.text[:2000]
+            order.brief = brief
         previous = order.assistant_notes or ""
         order.assistant_notes = previous + f"\nОтвет клиента: {message.text[:3000]}"
-        order.status = "admin_review"
+        order.status = "accepted" if is_revision else "admin_review"
         await db.commit()
 
     await message.answer(f"Ответ по заявке №{order_id[:8]} передан администратору.")
+    if is_revision:
+        asyncio.create_task(auto_generate_for_order(message.bot, order_id))
     await send_order_card(message.bot, settings.admin_id, order_id)
 
 
@@ -1130,6 +1471,19 @@ async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     bot = Bot(settings.bot_token)
+    # После перезапуска возобновляем прерванную работу (повторная генерация может быть платной).
+    async with Session() as db:
+        await db.execute(update(Order).where(Order.status == "generating").values(status="accepted"))
+        pending = list((await db.scalars(select(Order.id).where(Order.status == "accepted"))).all())
+        review_orders = list((await db.scalars(select(Order).where(Order.status == "demo_review"))).all())
+        pending_delivery = [o.id for o in review_orders if (o.brief or {}).get("design_assets") and all(
+            a.get("source") == "auto" for a in o.brief["design_assets"]
+        )]
+        await db.commit()
+    for order_id in pending:
+        asyncio.create_task(auto_generate_for_order(bot, order_id))
+    for order_id in pending_delivery:
+        asyncio.create_task(send_demo_to_client(bot, order_id))
     dp = Dispatcher(storage=DatabaseStorage())
     dp.include_router(router)
     try:
