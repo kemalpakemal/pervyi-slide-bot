@@ -224,7 +224,7 @@ def admin_menu():
         [KeyboardButton(text="📥 Все заявки"), KeyboardButton(text="🕒 На проверке")],
         [KeyboardButton(text="🎨 На генерации"), KeyboardButton(text="👁 На согласовании")],
         [KeyboardButton(text="💰 Оплаты"), KeyboardButton(text="👥 Клиенты")],
-        [KeyboardButton(text="🔎 Открыть заявку"), KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="🆔 Найти по ID"), KeyboardButton(text="⚙️ Настройки")],
         [KeyboardButton(text="📣 Рассылка"), KeyboardButton(text="📊 Статистика")],
         [KeyboardButton(text="⚙️ Состояние бота"), KeyboardButton(text="👤 Режим клиента")],
     ], resize_keyboard=True)
@@ -416,13 +416,50 @@ async def admin_health_button(message: Message):
     await health(message)
 
 
-@router.message(F.text == "🔎 Открыть заявку")
+@router.message(F.text == "🆔 Найти по ID")
 async def admin_review_button(message: Message, state: FSMContext):
     if not admin_only(message.from_user.id):
         return
     await state.clear()
     await state.set_state(AdminAction.lookup_order)
-    await message.answer("Отправь ID заявки (минимум 8 символов). Для отмены напиши «Отмена».")
+    await message.answer("Введи ID заявки минимум из 8 символов. Кнопки в карточках заявок открывают их напрямую. Для отмены нажми «Отмена».")
+
+
+@router.message(AdminAction.lookup_order, F.text.in_({
+    "📥 Все заявки", "🕒 На проверке", "🎨 На генерации", "👁 На согласовании",
+    "💰 Оплаты", "👥 Клиенты", "⚙️ Настройки", "📣 Рассылка", "📊 Статистика",
+    "⚙️ Состояние бота", "👤 Режим клиента", "🆔 Найти по ID",
+}))
+async def admin_lookup_navigation(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id):
+        return
+    value = (message.text or "").strip()
+    await state.clear()
+    if value == "📥 Все заявки":
+        await orders(message)
+    elif value == "🕒 На проверке":
+        await admin_pending_orders(message)
+    elif value == "🎨 На генерации":
+        await admin_generating_orders(message)
+    elif value == "👁 На согласовании":
+        await admin_reviewing_orders(message)
+    elif value == "💰 Оплаты":
+        await admin_payment_menu(message)
+    elif value == "👥 Клиенты":
+        await admin_clients(message)
+    elif value == "⚙️ Настройки":
+        await admin_settings(message)
+    elif value == "📣 Рассылка":
+        await admin_broadcast_start(message, state)
+    elif value == "📊 Статистика":
+        await admin_stats(message)
+    elif value == "⚙️ Состояние бота":
+        await health(message)
+    elif value == "👤 Режим клиента":
+        await admin_client_mode(message)
+    elif value == "🆔 Найти по ID":
+        await state.set_state(AdminAction.lookup_order)
+        await message.answer("Введи ID заявки минимум из 8 символов. Для отмены нажми «Отмена».")
 
 
 @router.message(AdminAction.lookup_order, F.text)
@@ -433,6 +470,9 @@ async def admin_lookup_order(message: Message, state: FSMContext):
     if value.casefold() in {"отмена", "/cancel"}:
         await state.clear()
         await message.answer("Поиск отменён.", reply_markup=admin_menu())
+        return
+    if len(value) < 8:
+        await message.answer("ID слишком короткий. Введи минимум 8 символов или нажми «Отмена».")
         return
     await state.clear()
     await review_order(message, f"/review {value}")
