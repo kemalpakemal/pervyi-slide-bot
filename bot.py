@@ -432,14 +432,12 @@ async def start(message: Message, state: FSMContext):
 async def admin_all_orders(message: Message):
     if not await require_admin_message(message):
         return
-        return
     await orders(message)
 
 
 @router.message(F.text == "🕒 На проверке")
 async def admin_pending_orders(message: Message):
     if not await require_admin_message(message):
-        return
         return
     await send_orders_list(message, statuses=["admin_review"], limit=30)
 
@@ -448,7 +446,6 @@ async def admin_pending_orders(message: Message):
 async def admin_health_button(message: Message):
     if not await require_admin_message(message):
         return
-        return
     await health(message)
 
 
@@ -456,10 +453,15 @@ async def admin_health_button(message: Message):
 async def admin_review_button(message: Message, state: FSMContext):
     if not await require_admin_message(message):
         return
-        return
     await state.clear()
     await state.set_state(AdminAction.lookup_order)
     await message.answer("Введи ID заявки минимум из 8 символов. Кнопки в карточках заявок открывают их напрямую. Для отмены нажми «Отмена».")
+
+
+@router.message(F.text.in_({"📥 Все заявки", "🕒 На проверке", "🎨 На генерации", "👁 На согласовании", "💰 Оплаты", "👥 Клиенты", "⚙️ Настройки", "📨 Напоминания", "📣 Рассылка", "📊 Статистика", "⚙️ Состояние бота", "👤 Режим клиента", "🆔 Найти по ID", "🔎 Открыть заявку"}))
+async def deny_admin_menu_to_non_owner(message: Message):
+    if not admin_only(message.from_user.id):
+        await message.answer("Панель управления доступна только владельцу бота.")
 
 
 @router.message(AdminAction.lookup_order, F.text.in_({
@@ -469,7 +471,6 @@ async def admin_review_button(message: Message, state: FSMContext):
 }))
 async def admin_lookup_navigation(message: Message, state: FSMContext):
     if not await require_admin_message(message):
-        return
         return
     value = (message.text or "").strip()
     await state.clear()
@@ -506,7 +507,6 @@ async def admin_lookup_navigation(message: Message, state: FSMContext):
 async def admin_lookup_order(message: Message, state: FSMContext):
     if not await require_admin_message(message):
         return
-        return
     value = (message.text or "").strip()
     if value.casefold() in {"отмена", "/cancel"}:
         await state.clear()
@@ -523,7 +523,6 @@ async def admin_lookup_order(message: Message, state: FSMContext):
 async def admin_client_mode(message: Message):
     if not await require_admin_message(message):
         return
-        return
     await message.answer("Клиентское меню включено. Для возврата к панели администратора напиши /start.", reply_markup=menu())
 
 
@@ -531,14 +530,12 @@ async def admin_client_mode(message: Message):
 async def admin_payments_button(message: Message):
     if not await require_admin_message(message):
         return
-        return
     await admin_payment_menu(message)
 
 
 @router.message(F.text == "📨 Напоминания")
 async def admin_reminders_button(message: Message):
     if not await require_admin_message(message):
-        return
         return
     active_statuses = [
         "admin_review", "waiting_client_info", "accepted", "manual_pending",
@@ -675,7 +672,6 @@ async def admin_settings(message: Message):
 @router.message(F.text == "📊 Статистика")
 async def admin_stats(message: Message):
     if not await require_admin_message(message):
-        return
         return
 
     week_ago = now() - timedelta(days=7)
@@ -1048,7 +1044,6 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
 async def send_clarification_to_client(message: Message, state: FSMContext):
     if not await require_admin_message(message):
         return
-        return
     text = (message.text or "").strip()
     if not text:
         await message.answer("Нужно отправить текстовое сообщение. Напиши уточнение одним сообщением.")
@@ -1342,7 +1337,6 @@ async def hermes_bridge_result(request: web.Request) -> web.Response:
 async def admin_hermes_agent(message: Message):
     if not await require_admin_message(message):
         return
-        return
     if not settings.hermes_bridge_token:
         await message.answer("Связь с Hermes на телефоне ещё не настроена.")
         return
@@ -1368,7 +1362,6 @@ async def admin_hermes_agent(message: Message):
 async def admin_hermes_status(message: Message):
     if not await require_admin_message(message):
         return
-        return
     async with Session() as db:
         jobs = list((await db.scalars(
             select(HermesJob).order_by(HermesJob.created_at.desc()).limit(8)
@@ -1388,14 +1381,12 @@ async def admin_hermes_status(message: Message):
 async def orders(message: Message):
     if not await require_admin_message(message):
         return
-        return
     await send_orders_list(message)
 
 
 @router.message(Command("review"))
 async def review_order(message: Message, command_text: str | None = None):
     if not await require_admin_message(message):
-        return
         return
     parts = (command_text or message.text or "").split(maxsplit=1)
     prefix = parts[1].strip() if len(parts) > 1 else ""
@@ -1856,7 +1847,6 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
 async def generate_order_design(message: Message, state: FSMContext):
     if not await require_admin_message(message):
         return
-        return
     parts = (message.text or "").split(maxsplit=1)
     prefix = parts[1].strip() if len(parts) > 1 else ""
     async with Session() as db:
@@ -2107,7 +2097,6 @@ async def manual_upload_help(message: Message, state: FSMContext):
 async def create_assistant_order(message: Message):
     if not await require_admin_message(message):
         return
-        return
     anchor_message = message.reply_to_message
     if anchor_message is None:
         await message.answer("Перешли сообщения клиента боту, затем ответь /order на одно из них.")
@@ -2296,7 +2285,6 @@ async def deliver_paid_originals(bot: Bot, order_id: str) -> tuple[bool, str]:
 async def quote_order(message: Message):
     if not await require_admin_message(message):
         return
-        return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
         await message.answer("Формат: /quote ID_ЗАЯВКИ СУММА [комментарий].")
@@ -2361,7 +2349,6 @@ async def quote_order(message: Message):
 async def paid(message: Message):
     if not await require_admin_message(message):
         return
-        return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
         await message.answer("Формат: /paid ID_ЗАЯВКИ СУММА [комментарий]. Команда подтверждает полную оплату и выдаёт оригиналы.")
@@ -2420,7 +2407,6 @@ async def paid(message: Message):
 @router.message(Command("deliver"))
 async def deliver_order_originals(message: Message):
     if not await require_admin_message(message):
-        return
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
