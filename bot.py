@@ -352,7 +352,7 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
         keyboard = order_action_menu(order_id)
     else:
         keyboard = None
-    await bot.send_message(admin_chat_id, "\\n".join(lines), reply_markup=keyboard)
+    await bot.send_message(admin_chat_id, "\n".join(lines), reply_markup=keyboard)
     for index, item in enumerate(attachments, start=1):
         try:
             caption = f"Материал {index}/{len(attachments)} · заявка {order_id[:8]}"
