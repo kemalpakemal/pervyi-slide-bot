@@ -4,7 +4,6 @@ import asyncio
 import base64
 import email.utils
 import io
-import mimetypes
 import random
 import warnings
 from datetime import datetime, timezone
@@ -49,7 +48,14 @@ def _normalise_generated_image(content: bytes) -> bytes:
             with Image.open(io.BytesIO(content)) as image:
                 oriented = ImageOps.exif_transpose(image)
                 oriented.load()
-                normalized = oriented.convert("RGB")
+                if oriented.mode in ("RGBA", "LA") or "transparency" in oriented.info:
+                    # Прозрачность без фона превращалась бы в чёрный; кладём на белый.
+                    rgba = oriented.convert("RGBA")
+                    flattened = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                    flattened.alpha_composite(rgba)
+                    normalized = flattened.convert("RGB")
+                else:
+                    normalized = oriented.convert("RGB")
                 buffer = io.BytesIO()
                 normalized.save(buffer, format="PNG", optimize=True)
                 result = buffer.getvalue()

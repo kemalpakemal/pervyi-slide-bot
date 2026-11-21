@@ -36,6 +36,22 @@ def api(method: str, path: str, payload: dict | None = None) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def post_result(payload: dict, attempts: int = 5) -> None:
+    """Отправляет результат с повторами: иначе задача навсегда остаётся в статусе running."""
+    for attempt in range(1, attempts + 1):
+        try:
+            api("POST", "/_bridge/hermes/result", payload)
+            return
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                print(f"[Hermes Bridge] Result rejected: HTTP {exc.code}", file=sys.stderr, flush=True)
+                return
+        except Exception as exc:
+            print(f"[Hermes Bridge] Result upload failed: {exc}", file=sys.stderr, flush=True)
+        if attempt < attempts:
+            time.sleep(min(30, 2 ** attempt))
+
+
 def run_job(job: dict) -> None:
     job_id = str(job["id"])
     prompt = str(job["prompt"])
@@ -51,20 +67,25 @@ def run_job(job: dict) -> None:
         output = (completed.stdout or "").strip()
         if completed.returncode != 0:
             error = (completed.stderr or output or f"hermes exited with code {completed.returncode}").strip()
-            api("POST", "/_bridge/hermes/result", {
+            post_result({
                 "job_id": job_id, "status": "failed", "error": error[-4000:],
             })
             print(f"[Hermes Bridge] Failed {job_id[:8]} (exit {completed.returncode})", flush=True)
             return
-        api("POST", "/_bridge/hermes/result", {
+        post_result({
             "job_id": job_id, "status": "done",
             "result": (output or "Hermes завершил задачу без текстового ответа.")[-24000:],
         })
         print(f"[Hermes Bridge] Completed {job_id[:8]}", flush=True)
     except subprocess.TimeoutExpired:
-        api("POST", "/_bridge/hermes/result", {
+        post_result({
             "job_id": job_id, "status": "failed",
             "error": f"Задача превысила лимит {TIMEOUT_SECONDS} секунд.",
+        })
+    except FileNotFoundError:
+        post_result({
+            "job_id": job_id, "status": "failed",
+            "error": f"Команда «{HERMES_BIN}» не найдена на телефоне. Проверь HERMES_BIN.",
         })
 
 

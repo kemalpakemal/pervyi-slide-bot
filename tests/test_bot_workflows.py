@@ -143,7 +143,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             from_user=SimpleNamespace(id=client_id),
             answer=AsyncMock(),
         )
-        await bot.forget(message)
+        await bot.forget(message, AsyncMock())
 
         async with self.session_factory() as db:
             paid = await db.get(bot.Order, paid_id)

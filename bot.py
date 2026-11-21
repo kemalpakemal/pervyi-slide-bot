@@ -1,6 +1,6 @@
 import asyncio
-import enum
 import hmac
+import logging
 import os
 import re
 import shutil
@@ -10,25 +10,35 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramRetryAfter
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiohttp import web
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup,
     InputMediaDocument, InputMediaPhoto, KeyboardButton, Message,
-    ReplyKeyboardMarkup, ReplyKeyboardRemove, FSInputFile,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, FSInputFile, LinkPreviewOptions,
 )
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, delete, select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from generation import ImageGenerationError, build_product_prompt, generate_two_images
 from image_pipeline import ImagePipelineError, apply_text_overlay, make_watermarked_demo, validate_image_file
+
+
+logger = logging.getLogger("pervyi-slide")
+
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_PRICE_PATH = BASE_DIR / "config" / "price.yaml"
+EXAMPLES_DIR = BASE_DIR / "content" / "examples"
+TELEGRAM_TEXT_LIMIT = 4000  # запас до жёсткого лимита Telegram (4096)
 
 
 class Settings(BaseSettings):
@@ -53,6 +63,27 @@ class Settings(BaseSettings):
     estimated_image_cost_usd: float = 0.25
     text_overlay_enabled: bool = False
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @field_validator("hermes_bridge_token")
+    @classmethod
+    def _check_bridge_token(cls, value: str | None) -> str | None:
+        value = (value or "").strip()
+        if not value:
+            return None
+        if len(value) < 32:
+            raise ValueError("HERMES_BRIDGE_TOKEN должен быть не короче 32 символов")
+        return value
+
+    @field_validator("openai_api_key")
+    @classmethod
+    def _blank_api_key(cls, value: str | None) -> str | None:
+        return (value or "").strip() or None
+
+    @property
+    def price_path(self) -> Path:
+        # Правки прайса через /price лежат на постоянном томе, иначе они теряются при деплое.
+        override = self.storage_path / "price.yaml"
+        return override if override.is_file() else DEFAULT_PRICE_PATH
 
     @property
     def db_url(self):
@@ -152,6 +183,8 @@ class DatabaseStorage(BaseStorage):
             if row is None:
                 if value is not None:
                     db.add(FSMRecord(key=self._key(key), state=str(value), data={}))
+            elif value is None and not row.data:
+                await db.delete(row)
             else:
                 row.state = str(value) if value is not None else None
             await db.commit()
@@ -165,7 +198,10 @@ class DatabaseStorage(BaseStorage):
         async with Session() as db:
             row = await db.get(FSMRecord, self._key(key))
             if row is None:
-                db.add(FSMRecord(key=self._key(key), state=None, data=dict(data)))
+                if data:
+                    db.add(FSMRecord(key=self._key(key), state=None, data=dict(data)))
+            elif not data and row.state is None:
+                await db.delete(row)
             else:
                 row.data = dict(data)
             await db.commit()
@@ -226,6 +262,134 @@ class HermesJob(Base):
 
 router = Router()
 
+STATUS_LABELS = {
+    "lead": "Лид", "brief": "Черновик", "admin_review": "На проверке",
+    "waiting_client_info": "Ждём клиента", "accepted": "Принята",
+    "generating": "Генерация", "manual_pending": "Ручная загрузка",
+    "demo_review": "Демо на проверке", "sending_demo": "Отправка демо",
+    "demo_sent": "Демо отправлено", "awaiting_payment": "Ожидает оплаты", "paid": "Оплачена",
+    "delivering_originals": "Выдача оригиналов", "paid_delivery_pending": "Оплата принята · выдача ожидает",
+    "completed": "Завершена", "privacy_erased": "Данные обезличены",
+    "rejected": "Отклонена", "cancelled": "Отменена",
+}
+
+ADMIN_MENU_BUTTONS = frozenset({
+    "📥 Все заявки", "🕒 На проверке", "🎨 На генерации", "👁 На согласовании",
+    "💰 Оплаты", "💳 Оплаты", "👥 Клиенты", "⚙️ Настройки", "📨 Напоминания",
+    "📣 Рассылка", "📊 Статистика", "⚙️ Состояние бота", "👤 Режим клиента",
+    "🆔 Найти по ID", "🔎 Открыть заявку",
+})
+MIN_ORDER_PREFIX = 8
+
+
+def split_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Режет длинный текст по строкам, чтобы уложиться в лимит Telegram (4096)."""
+    text = str(text or "")
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def send_long(bot: Bot, chat_id: int, text: str, reply_markup=None) -> None:
+    """Отправляет текст частями; клавиатура прикрепляется к последней части."""
+    chunks = split_text(text)
+    for index, chunk in enumerate(chunks):
+        last = index == len(chunks) - 1
+        await bot.send_message(chat_id, chunk, reply_markup=reply_markup if last else None)
+
+
+async def answer_long(message: Message, text: str, reply_markup=None) -> None:
+    await send_long(message.bot, message.chat.id, text, reply_markup=reply_markup)
+
+
+async def tg_retry(factory, attempts: int = 4):
+    """Повторяет вызов Telegram при флуд-лимите (429), уважая retry_after."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await factory()
+        except TelegramRetryAfter as exc:
+            if attempt >= attempts:
+                raise
+            await asyncio.sleep(min(float(exc.retry_after) + 0.5, 60.0))
+
+
+async def find_orders_by_prefix(db, prefix: str, limit: int = 2) -> list["Order"]:
+    """Поиск заявки по началу ID. Спецсимволы LIKE экранируются; нужно не меньше 8 символов."""
+    prefix = (prefix or "").strip()
+    if len(prefix) < MIN_ORDER_PREFIX:
+        return []
+    return list((await db.scalars(
+        select(Order).where(Order.id.startswith(prefix, autoescape=True)).limit(limit)
+    )).all())
+
+
+def parse_price_lines(text: str) -> list[dict]:
+    """Разбирает строки «Название — сумма». Бросает ValueError с понятным текстом."""
+    items: list[dict] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = re.match(r"^(.*\S)\s*[—–-]\s*(\d[\d\s\u00a0]*)\s*(?:₽|руб\.?|р\.?|RUB)?\s*$", line, flags=re.IGNORECASE)
+        if not match:
+            raise ValueError(f"Не понял строку «{line[:60]}». Используй формат «Название — сумма».")
+        if re.search(r"[—–-]\s*$", match.group(1)):
+            raise ValueError(f"Сумма не может быть отрицательной или пустой: «{line[:60]}».")
+        amount = int(re.sub(r"\D", "", match.group(2)))
+        items.append({"name": match.group(1).strip()[:100], "price": amount})
+    if not items:
+        raise ValueError("Прайс пуст. Отправь хотя бы одну позицию.")
+    return items
+
+
+def format_rub(value) -> str:
+    try:
+        return f"{int(value):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+class AdminMenuResetMiddleware(BaseMiddleware):
+    """Нажатие кнопки админ-меню отменяет «висящий» ввод (рассылка, прайс, поиск, уточнение).
+
+    Без этого следующее случайное сообщение владельца могло уйти всем клиентам как рассылка.
+    Режим ручной загрузки изображений при этом сохраняется.
+    """
+
+    async def __call__(self, handler, event, data):
+        if (
+            isinstance(event, Message)
+            and event.from_user is not None
+            and admin_only(event.from_user.id)
+            and (event.text or "") in ADMIN_MENU_BUTTONS
+        ):
+            state: FSMContext | None = data.get("state")
+            if state is not None:
+                current = await state.get_state()
+                if current and current != AdminAction.manual_images.state:
+                    await state.clear()
+        return await handler(event, data)
+
+
+router.message.outer_middleware(AdminMenuResetMiddleware())
+
 
 def menu():
     return ReplyKeyboardMarkup(keyboard=[
@@ -249,6 +413,10 @@ def admin_menu():
 def admin_only(user_id: int) -> bool:
     # Single-owner deployment: no staff roles or shared admin access.
     return user_id == settings.admin_id
+
+
+def _from_owner(message: Message) -> bool:
+    return message.from_user is not None and admin_only(message.from_user.id)
 
 
 async def require_admin_message(message: Message) -> bool:
@@ -314,16 +482,7 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
             select(Payment).where(Payment.order_id == order_id).order_by(Payment.created_at.desc())
         )).all())
 
-    status_labels = {
-        "lead": "Лид", "brief": "Черновик", "admin_review": "На проверке",
-        "waiting_client_info": "Ждём клиента", "accepted": "Принята",
-        "generating": "Генерация", "manual_pending": "Ручная загрузка",
-        "demo_review": "Демо на проверке", "sending_demo": "Отправка демо",
-        "demo_sent": "Демо отправлено", "awaiting_payment": "Ожидает оплаты", "paid": "Оплачена",
-        "delivering_originals": "Выдача оригиналов", "paid_delivery_pending": "Оплата принята · выдача ожидает",
-        "completed": "Завершена", "privacy_erased": "Данные обезличены",
-        "rejected": "Отклонена", "cancelled": "Отменена",
-    }
+    status_labels = STATUS_LABELS
     status_label = status_labels.get(status, status)
     created_label = created_at.strftime("%d.%m.%Y %H:%M UTC") if created_at else "дата неизвестна"
     who = first_name or "Имя не указано"
@@ -362,7 +521,7 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
             lines.append(f"{label}: {value}")
     reference_texts = brief.get("reference_texts") or []
     if reference_texts:
-        lines.append("Референсы: " + " | ".join(str(x) for x in reference_texts))
+        lines.append("Референсы: " + " | ".join(str(x)[:500] for x in reference_texts))
     if notes and notes != product:
         lines.append(f"Дополнительная информация: {notes}")
     if payments:
@@ -381,11 +540,11 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
         keyboard = manual_generation_menu(order_id)
     elif status == "demo_review":
         keyboard = design_review_menu(order_id)
-    elif status == "admin_review":
+    elif status in {"admin_review", "brief"}:
         keyboard = order_action_menu(order_id)
     else:
         keyboard = None
-    await bot.send_message(admin_chat_id, "\n".join(lines), reply_markup=keyboard)
+    await send_long(bot, admin_chat_id, "\n".join(lines), reply_markup=keyboard)
     for index, item in enumerate(attachments, start=1):
         try:
             caption = f"Материал {index}/{len(attachments)} · заявка {order_id[:8]}"
@@ -394,6 +553,7 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
             else:
                 await bot.send_document(admin_chat_id, item.telegram_file_id, caption=caption)
         except Exception:
+            logger.exception("Не удалось отправить материал %s заявки %s", index, order_id)
             await bot.send_message(admin_chat_id, f"Не удалось повторно отправить материал {index} заявки {order_id[:8]}.")
     return True
 
@@ -428,6 +588,78 @@ async def start(message: Message, state: FSMContext):
 
 
 
+@router.message(Command("cancel"))
+@router.message(F.text.casefold() == "отмена", ~StateFilter(None))
+async def cancel_user_action(message: Message, state: FSMContext):
+    if message.from_user is None:
+        return
+    await state.clear()
+    keyboard = admin_menu() if admin_only(message.from_user.id) else menu()
+    await message.answer("Текущее действие отменено.", reply_markup=keyboard)
+
+
+@router.message(Command("stop"))
+async def stop(message: Message):
+    async with Session() as db:
+        client = await get_client(db, message.from_user)
+        client.stopped = True
+        await db.commit()
+    await message.answer("Инициативные сообщения отключены. Для возобновления напиши /start.")
+
+
+@router.message(Command("forget"))
+async def forget(message: Message, state: FSMContext):
+    await state.clear()
+    storage_dirs: list[Path] = []
+    async with Session() as db:
+        client = await db.scalar(select(Client).where(Client.telegram_id == message.from_user.id))
+        if client:
+            orders = list((await db.scalars(
+                select(Order).where(Order.client_id == client.id)
+            )).all())
+            order_ids = [order.id for order in orders]
+            paid_order_ids: set[str] = set()
+            if order_ids:
+                paid_order_ids = set((await db.scalars(
+                    select(Payment.order_id).where(Payment.order_id.in_(order_ids)).distinct()
+                )).all())
+                await db.execute(delete(OrderFile).where(OrderFile.order_id.in_(order_ids)))
+            for order in orders:
+                storage_dirs.append(settings.storage_path / "orders" / order.id)
+                if order.id in paid_order_ids:
+                    # Keep the minimum transaction record, but remove personal and product data.
+                    order.status = "privacy_erased"
+                    order.source = "privacy_erased"
+                    order.assistant_notes = None
+                    order.brief = {"privacy_erased": True, "design_assets": [], "generation_metrics": {}}
+                else:
+                    await db.delete(order)
+            await db.execute(
+                delete(AssistantMaterial).where(AssistantMaterial.source_user_id == message.from_user.id)
+            )
+            if paid_order_ids:
+                # ID Telegram положительные; уникальный отрицательный суррогат не даёт заново связать запись
+                # и не конфликтует с unique при повторном /forget после новой оплаченной заявки.
+                surrogate = -abs(message.from_user.id)
+                if await db.scalar(select(Client.id).where(Client.telegram_id == surrogate)) is not None:
+                    surrogate = -(10**12 + client.id)
+                client.telegram_id = surrogate
+                client.username = None
+                client.first_name = None
+                client.stopped = True
+            else:
+                await db.delete(client)
+            await db.commit()
+
+    for directory in storage_dirs:
+        shutil.rmtree(directory, ignore_errors=True)
+
+    await message.answer(
+        "Персональные данные профиля и файлы удалены. Неоплаченные заявки удалены; "
+        "записи о ранее зарегистрированных оплатах сохранены в обезличенном виде."
+    )
+
+
 @router.message(F.text == "📥 Все заявки")
 async def admin_all_orders(message: Message):
     if not await require_admin_message(message):
@@ -458,7 +690,7 @@ async def admin_review_button(message: Message, state: FSMContext):
     await message.answer("Введи ID заявки минимум из 8 символов. Кнопки в карточках заявок открывают их напрямую. Для отмены нажми «Отмена».")
 
 
-@router.message(F.text.in_({"📥 Все заявки", "🕒 На проверке", "🎨 На генерации", "👁 На согласовании", "💰 Оплаты", "👥 Клиенты", "⚙️ Настройки", "📨 Напоминания", "📣 Рассылка", "📊 Статистика", "⚙️ Состояние бота", "👤 Режим клиента", "🆔 Найти по ID", "🔎 Открыть заявку"}))
+@router.message(F.text.in_({"📥 Все заявки", "🕒 На проверке", "🎨 На генерации", "👁 На согласовании", "💰 Оплаты", "👥 Клиенты", "⚙️ Настройки", "📨 Напоминания", "📣 Рассылка", "📊 Статистика", "⚙️ Состояние бота", "👤 Режим клиента", "🆔 Найти по ID", "🔎 Открыть заявку"}), ~F.func(_from_owner))
 async def deny_admin_menu_to_non_owner(message: Message):
     if not admin_only(message.from_user.id):
         await message.answer("Панель управления доступна только владельцу бота.")
@@ -748,16 +980,25 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Рассылка отменена.", reply_markup=admin_menu())
         return
+    if not body:
+        await message.answer("Текст пустой. Пришли текст рассылки или напиши «Отмена».")
+        return
+    if len(body) > TELEGRAM_TEXT_LIMIT:
+        await message.answer(f"Слишком длинный текст ({len(body)} симв.). Максимум — {TELEGRAM_TEXT_LIMIT}.")
+        return
     await state.clear()
     async with Session() as db:
-        ids = list((await db.scalars(select(Client.telegram_id).where(Client.stopped.is_(False)))).all())
+        ids = list((await db.scalars(
+            select(Client.telegram_id).where(Client.stopped.is_(False), Client.telegram_id > 0)
+        )).all())
     sent = failed = 0
     for telegram_id in ids:
         try:
-            await message.bot.send_message(telegram_id, body)
+            await tg_retry(lambda tid=telegram_id: message.bot.send_message(tid, body))
             sent += 1
         except Exception:
             failed += 1
+        await asyncio.sleep(0.05)  # ~20 сообщений/с, ниже лимита Telegram
     await message.answer(f"Рассылка завершена. Успешно: {sent}; ошибок: {failed}.", reply_markup=admin_menu())
 
 
@@ -778,27 +1019,19 @@ async def admin_price_save(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Изменение прайса отменено.", reply_markup=admin_menu())
         return
-    items = []
-    for line in (message.text or "").splitlines():
-        if not line.strip(): continue
-        parts = re.split(r"\s*[—–-]\s*", line.strip(), maxsplit=1)
-        if len(parts) != 2:
-            await message.answer("Не понял строку. Используй формат «Название — сумма».")
-            return
-        try: amount = int(parts[1].replace(" ", "").replace("₽", "").replace("руб.", ""))
-        except ValueError:
-            await message.answer(f"Некорректная сумма: {parts[1]}")
-            return
-        if amount < 0:
-            await message.answer("Сумма не может быть отрицательной.")
-            return
-        items.append({"name": parts[0][:100], "price": amount})
-    if not items:
-        await message.answer("Прайс пуст. Отправь хотя бы одну позицию.")
+    try:
+        items = parse_price_lines(message.text or "")
+    except ValueError as exc:
+        await message.answer(str(exc))
         return
-    path = Path("config/price.yaml")
+    path = settings.storage_path / "price.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump({"currency": "RUB", "items": items}, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tmp_path = path.with_suffix(".yaml.tmp")
+    tmp_path.write_text(
+        yaml.safe_dump({"currency": "RUB", "items": items}, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
     await state.clear()
     await message.answer(f"Прайс обновлён: {len(items)} позиций.", reply_markup=admin_menu())
 
@@ -830,37 +1063,61 @@ async def platform_step(message: Message, state: FSMContext):
     )
 
 
+async def require_text(message: Message) -> str | None:
+    """Шаги брифа принимают только текст; фото/стикеры раньше сохранялись как пустая строка."""
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Нужен текстовый ответ. Напиши его сообщением.")
+        return None
+    return text
+
+
 @router.message(Brief.product)
 async def product_step(message: Message, state: FSMContext):
-    await state.update_data(product=(message.text or "")[:1000])
+    text = await require_text(message)
+    if text is None:
+        return
+    await state.update_data(product=text[:1000])
     await state.set_state(Brief.advantages)
     await message.answer("Назови 3–5 главных преимуществ товара.")
 
 
 @router.message(Brief.advantages)
 async def advantages_step(message: Message, state: FSMContext):
-    await state.update_data(advantages=(message.text or "")[:2000])
+    text = await require_text(message)
+    if text is None:
+        return
+    await state.update_data(advantages=text[:2000])
     await state.set_state(Brief.required_text)
     await message.answer("Какие тексты или характеристики обязательно разместить? Если нет — напиши «на усмотрение студии».")
 
 
 @router.message(Brief.required_text)
 async def text_step(message: Message, state: FSMContext):
-    await state.update_data(required_text=(message.text or "")[:2000])
+    text = await require_text(message)
+    if text is None:
+        return
+    await state.update_data(required_text=text[:2000])
     await state.set_state(Brief.style)
     await message.answer("Какой стиль нужен? Например: минимализм, премиальный, яркий рекламный, технологичный.")
 
 
 @router.message(Brief.style)
 async def style_step(message: Message, state: FSMContext):
-    await state.update_data(style=(message.text or "")[:1000])
+    text = await require_text(message)
+    if text is None:
+        return
+    await state.update_data(style=text[:1000])
     await state.set_state(Brief.colors)
     await message.answer("Какие цвета использовать или избегать?")
 
 
 @router.message(Brief.colors)
 async def colors_step(message: Message, state: FSMContext):
-    await state.update_data(colors=(message.text or "")[:1000])
+    text = await require_text(message)
+    if text is None:
+        return
+    await state.update_data(colors=text[:1000])
     await state.set_state(Brief.slides)
     await message.answer("Сколько слайдов требуется? Укажи число от 1 до 20.")
 
@@ -868,7 +1125,7 @@ async def colors_step(message: Message, state: FSMContext):
 @router.message(Brief.slides)
 async def slides_step(message: Message, state: FSMContext):
     try:
-        count = int(message.text)
+        count = int((message.text or "").strip())
         if not 1 <= count <= 20:
             raise ValueError
     except (ValueError, TypeError):
@@ -881,7 +1138,10 @@ async def slides_step(message: Message, state: FSMContext):
 
 @router.message(Brief.deadline)
 async def deadline_step(message: Message, state: FSMContext):
-    await state.update_data(deadline=(message.text or "")[:500], files=[], reference_texts=[])
+    text = await require_text(message)
+    if text is None:
+        return
+    await state.update_data(deadline=text[:500], files=[], reference_texts=[])
     await state.set_state(Brief.materials)
     await message.answer("Сначала отправь главное фото товара, затем референсы. Можно несколько сообщений. Когда закончишь, напиши «Готово».")
 
@@ -892,11 +1152,15 @@ async def brief_done(message: Message, state: FSMContext):
     if not data.get("files"):
         await message.answer("Сначала приложи главное фото товара. Без него заявку нельзя передать в производство.")
         return
+    def short(key: str, limit: int = 300) -> str:
+        value = " ".join(str(data.get(key) or "").split())
+        return value if len(value) <= limit else value[:limit - 1] + "…"
+
     summary = (
-        f"Площадка: {data.get('platform')}\nТовар: {data.get('product')}\n"
-        f"Преимущества: {data.get('advantages')}\nТексты: {data.get('required_text')}\n"
-        f"Стиль: {data.get('style')}\nЦвета: {data.get('colors')}\n"
-        f"Слайдов: {data.get('slides')}\nСрок: {data.get('deadline')}\n"
+        f"Площадка: {data.get('platform')}\nТовар: {short('product')}\n"
+        f"Преимущества: {short('advantages')}\nТексты: {short('required_text')}\n"
+        f"Стиль: {short('style')}\nЦвета: {short('colors')}\n"
+        f"Слайдов: {data.get('slides')}\nСрок: {short('deadline', 150)}\n"
         f"Файлов: {len(data.get('files', []))}\nРеференсов: {len(data.get('reference_texts', []))}"
     )
     await state.update_data(summary=summary)
@@ -942,6 +1206,14 @@ async def material_step(message: Message, state: FSMContext):
     await message.answer(f"Материал принят ({len(files)}). Можешь отправить следующий или написать «Готово».")
 
 
+@router.message(Brief.confirmation)
+async def confirmation_hint(message: Message):
+    await message.answer(
+        "Проверь бриф и нажми «Подтвердить бриф» или «Заполнить заново». Отменить заявку: /cancel.",
+        reply_markup=confirm_menu(),
+    )
+
+
 @router.callback_query(F.data == "brief:confirm", Brief.confirmation)
 async def confirm_brief(call: CallbackQuery, state: FSMContext):
     if call.from_user is None:
@@ -960,9 +1232,22 @@ async def confirm_brief(call: CallbackQuery, state: FSMContext):
         await db.commit()
         order_id = order.id
     await state.clear()
-    await call.message.edit_text(f"Бриф принят. Номер заявки: {order_id[:8]}. Администратор проверит материалы и свяжется с тобой.")
+    try:
+        await call.message.edit_text(f"Бриф принят. Номер заявки: {order_id[:8]}. Администратор проверит материалы и свяжется с тобой.")
+    except Exception:
+        await call.message.answer(f"Бриф принят. Номер заявки: {order_id[:8]}. Администратор проверит материалы и свяжется с тобой.")
     await call.answer()
-    await send_order_card(call.bot, settings.admin_id, order_id)
+    try:
+        await send_order_card(call.bot, settings.admin_id, order_id)
+    except Exception:
+        logger.exception("Не удалось отправить карточку заявки %s владельцу", order_id)
+        try:
+            await call.bot.send_message(
+                settings.admin_id,
+                f"Новая заявка {order_id[:8]}, но карточку отправить не удалось. Открой её: /review {order_id[:8]}",
+            )
+        except Exception:
+            logger.exception("Не удалось уведомить владельца о заявке %s", order_id)
 
 
 
@@ -983,11 +1268,17 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
         if order is None:
             await call.answer("Заявка не найдена.", show_alert=True)
             return
-        if order.status != "admin_review":
+        if order.status not in {"admin_review", "brief"}:
             await call.answer(f"Заявка уже обработана. Статус: {order.status}", show_alert=True)
+            return
+        if order.status == "brief" and action == "clarify":
+            await call.answer("Для черновика из пересланных сообщений уточнение недоступно.", show_alert=True)
             return
         client = await db.get(Client, order.client_id)
         client_telegram_id = client.telegram_id if client else None
+        if order.source == "assistant":
+            # Заявка заведена владельцем вручную: клиенту ничего не отправляем автоматически.
+            client_telegram_id = None
 
         if action == "accept":
             order.status = "accepted"
@@ -1041,7 +1332,7 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
             )
 
 
-@router.message(AdminAction.clarification)
+@router.message(AdminAction.clarification, ~F.text.startswith("/"))
 async def send_clarification_to_client(message: Message, state: FSMContext):
     if not await require_admin_message(message):
         return
@@ -1095,23 +1386,32 @@ async def restart_brief(call: CallbackQuery, state: FSMContext):
 
 @router.message(F.text == "Примеры работ")
 async def examples(message: Message):
-    folder = Path("content/examples")
+    folder = EXAMPLES_DIR
     files = sorted(p for p in folder.glob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}) if folder.exists() else []
     if not files:
         await message.answer("Примеры пока не добавлены.")
         return
     for file in files[:10]:
-        await message.answer_photo(file.open("rb"), caption=file.name)
+        try:
+            await tg_retry(lambda f=file: message.answer_photo(FSInputFile(f), caption=f.stem[:200]))
+        except Exception:
+            logger.exception("Не удалось отправить пример %s", file.name)
 
 
 @router.message(F.text == "Цены")
 async def prices(message: Message):
     try:
-        data = yaml.safe_load(Path("config/price.yaml").read_text(encoding="utf-8")) or {}
+        data = yaml.safe_load(settings.price_path.read_text(encoding="utf-8")) or {}
         items = data.get("items", [])
         currency = data.get("currency", "RUB")
-        lines = [f"• {x['name']}: {x['price']} {currency}" for x in items if isinstance(x, dict) and x.get("name") and x.get("price") not in (None, "")]
+        symbol = "₽" if str(currency).upper() == "RUB" else currency
+        lines = [
+            f"• {x['name']}: {format_rub(x['price'])} {symbol}"
+            for x in items
+            if isinstance(x, dict) and x.get("name") and x.get("price") not in (None, "")
+        ]
     except Exception:
+        logger.exception("Не удалось прочитать прайс")
         lines = []
     await message.answer("\n".join(lines) if lines else "Прайс ещё не заполнен. Уточни стоимость у администратора.")
 
@@ -1128,7 +1428,15 @@ async def contact_done(message: Message, state: FSMContext):
     data = await state.get_data()
     body = "\n".join(data.get("contact_messages", []))
     if body:
-        await message.bot.send_message(settings.admin_id, f"Обращение от {message.from_user.id} (@{message.from_user.username or 'нет username'}):\n\n{body}")
+        try:
+            await send_long(
+                message.bot, settings.admin_id,
+                f"Обращение от {message.from_user.id} (@{message.from_user.username or 'нет username'}):\n\n{body}",
+            )
+        except Exception:
+            logger.exception("Не удалось передать обращение владельцу")
+            await message.answer("Не удалось передать сообщение. Попробуй ещё раз чуть позже.", reply_markup=menu())
+            return
         await message.answer("Сообщение передано администратору.", reply_markup=menu())
     else:
         await message.answer("Пустое обращение отменено.", reply_markup=menu())
@@ -1181,16 +1489,7 @@ async def send_orders_list(message: Message, statuses: list[str] | None = None, 
         await message.answer("Заявок в этом разделе нет.", reply_markup=admin_menu())
         return
 
-    status_labels = {
-        "lead": "Лид", "brief": "Черновик", "admin_review": "На проверке",
-        "waiting_client_info": "Ждём клиента", "accepted": "Принята",
-        "generating": "Генерация", "manual_pending": "Ручная загрузка",
-        "demo_review": "Демо на проверке", "sending_demo": "Отправка демо",
-        "demo_sent": "Демо отправлено", "awaiting_payment": "Ожидает оплаты", "paid": "Оплачена",
-        "delivering_originals": "Выдача оригиналов", "paid_delivery_pending": "Оплата принята · выдача ожидает",
-        "completed": "Завершена", "privacy_erased": "Данные обезличены",
-        "rejected": "Отклонена", "cancelled": "Отменена",
-    }
+    status_labels = STATUS_LABELS
     await message.answer(
         f"Заявки · показано {len(records)}"
         + (f" · фильтр: {', '.join(statuses)}" if statuses else ""),
@@ -1240,12 +1539,17 @@ async def admin_open_order(call: CallbackQuery):
 
 
 
+HERMES_STALE_SECONDS = 3600
+
 # Hermes phone bridge: the existing aiogram bot remains the sole Telegram
 # getUpdates consumer. The phone connects outbound over HTTPS and polls jobs.
 def _hermes_bridge_authorized(request: web.Request) -> bool:
     expected = settings.hermes_bridge_token or ""
     supplied = request.headers.get("Authorization", "")
-    return bool(expected) and hmac.compare_digest(supplied, f"Bearer {expected}")
+    # compare_digest со строками падает на не-ASCII заголовке (TypeError → HTTP 500), сравниваем байты.
+    return bool(expected) and hmac.compare_digest(
+        supplied.encode("utf-8", "ignore"), f"Bearer {expected}".encode("utf-8")
+    )
 
 
 def _hermes_bridge_unauthorized() -> web.Response:
@@ -1271,6 +1575,13 @@ async def hermes_bridge_next(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     async with Session() as db:
+        # Телефон мог отключиться посреди задачи: «зависшие» running закрываем как ошибочные.
+        stale_before = now() - timedelta(seconds=HERMES_STALE_SECONDS)
+        await db.execute(
+            update(HermesJob)
+            .where(HermesJob.status == "running", HermesJob.claimed_at < stale_before)
+            .values(status="failed", error="Воркер не вернул результат вовремя.", finished_at=now())
+        )
         statement = (
             select(HermesJob)
             .where(HermesJob.status == "queued")
@@ -1280,6 +1591,7 @@ async def hermes_bridge_next(request: web.Request) -> web.Response:
         )
         job = await db.scalar(statement)
         if job is None:
+            await db.commit()
             return web.json_response({"job": None})
         job.status = "running"
         job.claimed_at = now()
@@ -1322,13 +1634,17 @@ async def hermes_bridge_result(request: web.Request) -> web.Response:
     body = result_text if outcome == "done" else (error_text or "Hermes завершил задачу с ошибкой.")
     if not body:
         body = "Hermes завершил задачу без текстового ответа."
-    await bot.send_message(settings.admin_id, heading)
-    for offset in range(0, len(body), 3500):
-        await bot.send_message(
-            settings.admin_id,
-            body[offset:offset + 3500],
-            disable_web_page_preview=True,
-        )
+    try:
+        await bot.send_message(settings.admin_id, heading)
+        for offset in range(0, len(body), 3500):
+            await tg_retry(lambda chunk=body[offset:offset + 3500]: bot.send_message(
+                settings.admin_id,
+                chunk,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            ))
+    except Exception:
+        # Результат уже сохранён в БД; воркеру не нужно повторять запрос из-за сбоя Telegram.
+        logger.exception("Не удалось доставить результат Hermes владельцу")
     return web.json_response({"ok": True})
 
 
@@ -1398,12 +1714,10 @@ async def review_order(message: Message, command_text: str | None = None):
     prefix = parts[1].strip() if len(parts) > 1 else ""
     async with Session() as db:
         if prefix:
-            if len(prefix) < 8:
+            if len(prefix) < MIN_ORDER_PREFIX:
                 await message.answer("Для поиска заявки укажи минимум 8 символов ID.")
                 return
-            matches = list((await db.scalars(
-                select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
-            )).all())
+            matches = await find_orders_by_prefix(db, prefix)
             if not matches:
                 await message.answer("Заявка с таким ID не найдена.")
                 return
@@ -1496,10 +1810,15 @@ async def _download_order_inputs(bot: Bot, order_id: str, attachments: list[Orde
                 validate_image_file(path, max_bytes=settings.max_file_mb * 1024 * 1024)
                 paths.append(path)
         except Exception:
+            logger.exception("Не удалось получить вложение %s заявки %s", index, order_id)
             try:
                 path.unlink(missing_ok=True)
             except (UnboundLocalError, OSError):
                 pass
+            if index == 1:
+                # Первое изображение — «источник истины» о товаре. Если оно недоступно,
+                # нельзя тихо подставить референс вместо товара.
+                return []
             continue
     return paths
 
@@ -1656,20 +1975,25 @@ async def _send_manual_bundle(
         return " ".join(str(value or "").split())[:limit] or "не указано"
 
     sequence = ", ".join(f"{x['slide']}/{x['variant']}" for x in slots)
-    caption = (
+    tail = (
+        "Первое изображение во вложениях — сам товар, остальные — только референсы. "
+        "Строго сохрани форму, пропорции, цвет, конструкцию, упаковку, логотип, этикетку "
+        "и все надписи на товаре. Ничего не выдумывай. Не закрывай товар текстом. "
+        "Сделай по два разных варианта для каждого слайда. "
+        "Слайд 1 — обложка; следующие — отдельные инфографические преимущества. "
+        f"Порядок файлов (слайд/вариант): {sequence}. Один файл на одну позицию."
+    )
+    head = (
         "Создай отдельные карточки товара для маркетплейса. "
         f"Товар: {compact('product', 100)}. "
         f"Преимущества: {compact('advantages', 80)}. "
         f"Обязательные тексты/факты: {compact('required_text', 80)}. "
         f"Стиль: {compact('style', 30)}. Цвета: {compact('colors', 30)}. "
         f"Пожелания к референсам: {compact('reference_texts', 70)}. "
-        "Первое изображение во вложениях — сам товар, остальные — только референсы. "
-        "Строго сохрани форму, пропорции, цвет, конструкцию, упаковку, логотип, этикетку "
-        "и все надписи на товаре. Ничего не выдумывай. Не закрывай товар текстом. "
-        "Сделай по два разных варианта для каждого слайда. "
-        "Слайд 1 — обложка; следующие — отдельные инфографические преимущества. "
-        f"Порядок файлов: {sequence}. Один файл на одну позицию."
-    )[:1024]
+    )
+    # Лимит подписи Telegram — 1024. Обрезаем бриф, но не инструкцию и не порядок файлов.
+    room = 1024 - len(tail) - 1
+    caption = (head[:room].rstrip() + " " + tail) if room > 0 else tail[:1024]
 
     await state.clear()
     source_ids = await _send_album(bot, settings.admin_id, input_paths[:20], caption=caption, documents=True)
@@ -1691,7 +2015,39 @@ async def _send_manual_bundle(
     )
 
 
+_background_tasks: set[asyncio.Task] = set()
+
+
 async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force_manual: bool = False) -> None:
+    """Запускает генерацию; любая неожиданная ошибка переводит заявку в ручной режим, а не «зависает»."""
+    try:
+        await _begin_generation_impl(bot, state, order_id, force_manual=force_manual)
+    except Exception:
+        logger.exception("Сбой генерации заявки %s", order_id)
+        try:
+            async with Session() as db:
+                order = await db.get(Order, order_id)
+                if order is not None and order.status == "generating":
+                    order.status = "manual_pending"
+                    await db.commit()
+            await bot.send_message(
+                settings.admin_id,
+                f"Заявка {order_id[:8]}: при обработке произошла ошибка, статус «Ручная загрузка». "
+                "Подробности в логах. Можно повторить генерацию или продолжить вручную.",
+                reply_markup=manual_generation_menu(order_id),
+            )
+        except Exception:
+            logger.exception("Не удалось сообщить владельцу о сбое заявки %s", order_id)
+
+
+def spawn_generation(bot: Bot, state: FSMContext, order_id: str, *, force_manual: bool = False) -> None:
+    """Долгая генерация идёт в фоне: иначе блокируется очередь апдейтов владельца (изоляция событий)."""
+    task = asyncio.create_task(_begin_generation(bot, state, order_id, force_manual=force_manual))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _begin_generation_impl(bot: Bot, state: FSMContext, order_id: str, *, force_manual: bool = False) -> None:
     if await state.get_state() is not None:
         await bot.send_message(
             settings.admin_id,
@@ -1857,9 +2213,9 @@ async def generate_order_design(message: Message, state: FSMContext):
     prefix = parts[1].strip() if len(parts) > 1 else ""
     async with Session() as db:
         if prefix:
-            matches = list((await db.scalars(select(Order).where(Order.id.like(f"{prefix}%")).limit(2))).all())
+            matches = await find_orders_by_prefix(db, prefix)
             if not matches:
-                await message.answer("Заявка не найдена.")
+                await message.answer("Заявка не найдена (нужно минимум 8 символов ID).")
                 return
             if len(matches) > 1:
                 await message.answer("Найдено несколько заявок. Укажи больше символов ID.")
@@ -1874,7 +2230,11 @@ async def generate_order_design(message: Message, state: FSMContext):
                 await message.answer("Нет принятых заявок, готовых к генерации.")
                 return
             order_id = order.id
-    await _begin_generation(message.bot, state, order_id)
+    if await state.get_state() is not None:
+        await message.answer("Сначала заверши или отмени текущее действие (/cancel).")
+        return
+    await message.answer(f"Запускаю обработку заявки {order_id[:8]}. Результат пришлю отдельным сообщением.")
+    spawn_generation(message.bot, state, order_id)
 
 
 @router.callback_query(F.data.startswith("design:"))
@@ -1888,8 +2248,14 @@ async def process_design_action(call: CallbackQuery, state: FSMContext):
         return
 
     if action in {"create", "retry"}:
+        if not await admin_workflow_available(state, order_id):
+            await call.answer("Сначала заверши или отмени текущий ручной сценарий (/cancel).", show_alert=True)
+            return
+        # «Повторить генерацию» нажимают прямо из сообщения ручного режима этой же заявки.
+        if await state.get_state() is not None:
+            await state.clear()
         await call.answer("Запускаю обработку заявки.")
-        await _begin_generation(call.bot, state, order_id)
+        spawn_generation(call.bot, state, order_id)
         return
 
     if action == "manual":
@@ -1939,20 +2305,21 @@ async def process_design_action(call: CallbackQuery, state: FSMContext):
         await call.answer("Не найден клиент или отсутствуют готовые демо.", show_alert=True)
         return
     try:
-        await call.bot.send_message(
+        await tg_retry(lambda: call.bot.send_message(
             client_telegram_id,
             f"Подготовлено демо по заявке №{order_id[:8]}. Это предварительные изображения с водяным знаком. "
             "Напиши, что нужно поправить. Оригиналы без водяного знака передаются только после согласования и оплаты."
-        )
+        ))
         for asset in assets:
             demo_path = Path(asset.get("demo_path", ""))
             if not demo_path.is_file():
                 raise ImagePipelineError("Демо-файл отсутствует.")
-            await call.bot.send_photo(
-                client_telegram_id, FSInputFile(demo_path),
+            await tg_retry(lambda path=demo_path, asset=asset: call.bot.send_photo(
+                client_telegram_id, FSInputFile(path),
                 caption=f"Демо · слайд {asset.get('slide')} · вариант {asset.get('variant')}",
-            )
+            ))
     except Exception:
+        logger.exception("Не удалось отправить демо заявки %s", order_id)
         await _set_order_status(order_id, "demo_review")
         await call.message.answer("Не удалось доставить демо. Статус сохранён для повторной проверки.")
         await call.answer("Отправка не удалась.", show_alert=True)
@@ -2081,6 +2448,7 @@ async def receive_manual_variants(message: Message, state: FSMContext):
                 note="Ручная загрузка завершена. Оригиналы сохранены без водяного знака.",
             )
     except Exception:
+        logger.exception("Не удалось обработать ручной вариант заявки %s", order_id)
         await message.answer(
             "Не удалось обработать файл. Попробуй отправить изображение ещё раз ответом на исходный альбом."
         )
@@ -2141,12 +2509,11 @@ async def create_assistant_order(message: Message):
         order_id = order.id
         client_id = client.telegram_id
     await message.answer(f"Создан черновик заказа {order_id[:8]}. Клиент: {client_id}. Бот клиенту не писал.")
+    await send_order_card(message.bot, message.chat.id, order_id)
 
 
-@router.message(F.forward_origin)
+@router.message(F.forward_origin, F.func(_from_owner))
 async def collect_forward(message: Message):
-    if not await require_admin_message(message):
-        return
     origin = message.forward_origin
     sender = getattr(origin, "sender_user", None)
     file_id = file_type = filename = None
@@ -2261,14 +2628,15 @@ async def _deliver_paid_originals_locked(bot: Bot, order_id: str) -> tuple[bool,
         for key, path, slide, variant in files:
             if key in sent_assets:
                 continue
-            await bot.send_document(
+            await tg_retry(lambda path=path, slide=slide, variant=variant: bot.send_document(
                 client_id,
                 FSInputFile(path),
                 caption=f"Оригинал · слайд {slide} · вариант {variant}",
-            )
+            ))
             sent_assets.add(key)
             await _update_original_delivery(order_id, sent_asset=key)
     except Exception:
+        logger.exception("Сбой выдачи оригиналов заявки %s", order_id)
         await _update_original_delivery(order_id, status="paid_delivery_pending")
         return False, f"Часть оригиналов могла быть отправлена. Повтори команду /deliver {order_id[:8]} — уже доставленные файлы повторно не отправятся."
 
@@ -2306,9 +2674,7 @@ async def quote_order(message: Message):
         return
 
     async with Session() as db:
-        matches = list((await db.scalars(
-            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
-        )).all())
+        matches = await find_orders_by_prefix(db, prefix)
         if len(matches) != 1:
             await message.answer("Заявка не найдена или ID неоднозначен.")
             return
@@ -2369,9 +2735,7 @@ async def paid(message: Message):
         await message.answer("Сумма должна быть больше нуля.")
         return
     async with Session() as db:
-        matches = list((await db.scalars(
-            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
-        )).all())
+        matches = await find_orders_by_prefix(db, prefix)
         if len(matches) != 1:
             await message.answer("Заявка не найдена или ID неоднозначен.")
             return
@@ -2418,9 +2782,7 @@ async def deliver_order_originals(message: Message):
         return
     prefix = parts[1].strip()
     async with Session() as db:
-        matches = list((await db.scalars(
-            select(Order).where(Order.id.like(f"{prefix}%")).limit(2)
-        )).all())
+        matches = await find_orders_by_prefix(db, prefix)
         if len(matches) != 1:
             await message.answer("Заявка не найдена или ID неоднозначен.")
             return
@@ -2439,7 +2801,7 @@ async def remind(message: Message):
         return
     prefix = parts[1].strip()
     async with Session() as db:
-        matches = list((await db.scalars(select(Order).where(Order.id.like(f"{prefix}%")).limit(2))).all())
+        matches = await find_orders_by_prefix(db, prefix)
         if len(matches) != 1:
             await message.answer("Заявка не найдена или ID неоднозначен.")
             return
@@ -2449,6 +2811,9 @@ async def remind(message: Message):
         if order.status in {"completed", "rejected", "cancelled", "privacy_erased"}:
             await message.answer("По этой заявке напоминание отправлять нельзя: она завершена, отклонена или обезличена.")
             return
+        if client is not None and client.stopped:
+            await message.answer("Клиент отключил инициативные сообщения (/stop). Напоминание не отправлено.")
+            return
     if not client_id:
         await message.answer("У заявки не найден клиент.")
         return
@@ -2456,78 +2821,33 @@ async def remind(message: Message):
         await message.bot.send_message(client_id, f"Напоминание по заявке №{order.id[:8]}. Напиши нам, если хочешь продолжить оформление.")
         await message.answer(f"Напоминание отправлено клиенту по заявке {order.id[:8]}.")
     except Exception:
+        logger.exception("Не удалось отправить напоминание по заявке %s", order.id)
         await message.answer("Не удалось доставить напоминание клиенту.")
 
 
-@router.message(Command("cancel"))
-async def cancel_user_action(message: Message, state: FSMContext):
-    if message.from_user is None:
-        return
-    await state.clear()
-    await message.answer("Текущее действие отменено.", reply_markup=menu())
+@router.message(F.text.startswith("/"))
+async def deny_unknown_commands(message: Message):
+    if message.from_user is None or not admin_only(message.from_user.id):
+        await message.answer("Эта команда не поддерживается. Используй кнопки клиентского меню.")
+    else:
+        await message.answer("Неизвестная команда. Список команд владельца: /admin")
 
 
-@router.message(Command("stop"))
-async def stop(message: Message):
-    async with Session() as db:
-        client = await get_client(db, message.from_user)
-        client.stopped = True
-        await db.commit()
-    await message.answer("Инициативные сообщения отключены. Для возобновления напиши /start.")
-
-
-@router.message(Command("forget"))
-async def forget(message: Message):
-    storage_dirs: list[Path] = []
-    async with Session() as db:
-        client = await db.scalar(select(Client).where(Client.telegram_id == message.from_user.id))
-        if client:
-            orders = list((await db.scalars(
-                select(Order).where(Order.client_id == client.id)
-            )).all())
-            order_ids = [order.id for order in orders]
-            paid_order_ids: set[str] = set()
-            if order_ids:
-                paid_order_ids = set((await db.scalars(
-                    select(Payment.order_id).where(Payment.order_id.in_(order_ids)).distinct()
-                )).all())
-                await db.execute(delete(OrderFile).where(OrderFile.order_id.in_(order_ids)))
-            for order in orders:
-                storage_dirs.append(settings.storage_path / "orders" / order.id)
-                if order.id in paid_order_ids:
-                    # Keep the minimum transaction record, but remove personal and product data.
-                    order.status = "privacy_erased"
-                    order.source = "privacy_erased"
-                    order.assistant_notes = None
-                    order.brief = {"privacy_erased": True, "design_assets": [], "generation_metrics": {}}
-                else:
-                    await db.delete(order)
-            await db.execute(
-                delete(AssistantMaterial).where(AssistantMaterial.source_user_id == message.from_user.id)
-            )
-            if paid_order_ids:
-                # Telegram user IDs are positive; a negative surrogate prevents relinking the record.
-                client.telegram_id = -abs(message.from_user.id)
-                client.username = None
-                client.first_name = None
-                client.stopped = True
-            else:
-                await db.delete(client)
-            await db.commit()
-
-    for directory in storage_dirs:
-        shutil.rmtree(directory, ignore_errors=True)
-
-    await message.answer(
-        "Персональные данные профиля и файлы удалены. Неоплаченные заявки удалены; "
-        "записи о ранее зарегистрированных оплатах сохранены в обезличенном виде."
-    )
-
-
-@router.message(F.text)
+@router.message(F.text | F.photo | F.document)
 async def forward_client_clarification(message: Message):
-    # Перехватываем обычный текст только когда от этого клиента действительно ждут уточнение.
+    # Перехватываем сообщение только когда от этого клиента действительно ждут уточнение.
     if message.from_user is None or admin_only(message.from_user.id):
+        return
+    text = (message.text or message.caption or "").strip()
+    file_id = file_type = filename = None
+    if message.photo:
+        file_id, file_type = message.photo[-1].file_id, "photo"
+    elif message.document:
+        if message.document.mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+            file_id = None
+        else:
+            file_id, file_type, filename = message.document.file_id, "document", message.document.file_name
+    if not text and not file_id:
         return
     async with Session() as db:
         client = await db.scalar(select(Client).where(Client.telegram_id == message.from_user.id))
@@ -2542,8 +2862,16 @@ async def forward_client_clarification(message: Message):
         if order is None:
             return
         order_id = order.id
-        previous = order.assistant_notes or ""
-        order.assistant_notes = previous + f"\nОтвет клиента: {message.text[:3000]}"
+        if text:
+            previous = order.assistant_notes or ""
+            order.assistant_notes = previous + f"\nОтвет клиента: {text[:3000]}"
+        if file_id:
+            existing = int(await db.scalar(
+                select(func.count(OrderFile.id)).where(OrderFile.order_id == order_id)
+            ) or 0)
+            if existing < settings.max_files_per_order:
+                db.add(OrderFile(order_id=order_id, telegram_file_id=file_id,
+                                 file_type=file_type, original_name=filename))
         order.status = "admin_review"
         await db.commit()
 
@@ -2594,12 +2922,6 @@ async def recover_interrupted_orders() -> list[str]:
     return recovered
 
 
-@router.message(F.text.startswith("/"))
-async def deny_unknown_commands(message: Message):
-    if message.from_user is None or not admin_only(message.from_user.id):
-        await message.answer("Эта команда не поддерживается. Используй кнопки клиентского меню.")
-
-
 @router.callback_query()
 async def deny_unknown_callbacks(call: CallbackQuery):
     # Every actionable inline button is explicitly routed above. Unknown callback
@@ -2610,7 +2932,36 @@ async def deny_unknown_callbacks(call: CallbackQuery):
         await call.answer("Неизвестное действие.", show_alert=True)
 
 
+@router.errors()
+async def on_error(event: ErrorEvent, bot: Bot) -> bool:
+    logger.error("Необработанная ошибка при обработке апдейта", exc_info=event.exception)
+    update = event.update
+    user_id = None
+    if update.message and update.message.from_user:
+        user_id = update.message.from_user.id
+    elif update.callback_query and update.callback_query.from_user:
+        user_id = update.callback_query.from_user.id
+    if user_id is not None and user_id != settings.admin_id:
+        try:
+            await bot.send_message(user_id, "Что-то пошло не так. Попробуй ещё раз или напиши /start.")
+        except Exception:
+            pass
+    elif user_id == settings.admin_id:
+        try:
+            await bot.send_message(
+                settings.admin_id,
+                f"Ошибка: {type(event.exception).__name__}. Подробности в логах сервиса.",
+            )
+        except Exception:
+            pass
+    return True
+
+
 async def main():
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     recovered = await recover_interrupted_orders()
