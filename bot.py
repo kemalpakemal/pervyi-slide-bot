@@ -27,6 +27,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from generation import ImageGenerationError, build_product_prompt, generate_two_images
 from image_pipeline import ImagePipelineError, apply_text_overlay, make_watermarked_demo
+from telemetry import track_event, shutdown_telemetry
 
 
 class Settings(BaseSettings):
@@ -457,6 +458,8 @@ async def confirm_brief(call: CallbackQuery, state: FSMContext):
                              file_type=item["type"], original_name=item.get("name")))
         await db.commit()
         order_id = order.id
+        client_db_id = client.id
+    track_event("order_submitted", str(client_db_id), {"platform": str(data.get("platform") or "unknown"), "slides": int(data.get("slides") or 1), "source": "bot"})
     await state.clear()
     await call.message.edit_text(f"Бриф принят. Номер заявки: {order_id[:8]}. Администратор проверит материалы и свяжется с тобой.")
     await call.answer()
@@ -487,6 +490,8 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
             return
         client = await db.get(Client, order.client_id)
         client_telegram_id = client.telegram_id if client else None
+        client_db_id = order.client_id
+        order_platform = str((order.brief or {}).get("platform") or "unknown")
 
         if action == "accept":
             order.status = "accepted"
@@ -501,6 +506,9 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
         else:
             await call.answer("Неизвестное действие.", show_alert=True)
             return
+
+    if action in {"accept", "reject"}:
+        track_event("order_status_changed", str(client_db_id), {"status": "accepted" if action == "accept" else "rejected", "platform": order_platform})
 
     if action == "clarify":
         await call.message.edit_reply_markup(reply_markup=None)
@@ -1009,6 +1017,7 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
 
     await state.clear()
     total = _slide_total(brief)
+    track_event("generation_started", str(order.client_id), {"mode": "manual" if force_manual or settings.image_mode.strip().lower() != "auto" or not settings.openai_api_key else "auto", "slides": total, "platform": str(brief.get("platform") or "unknown")})
     requested = int(brief.get("slides") or 1)
     if requested > settings.max_generation_slides:
         await bot.send_message(
@@ -1033,6 +1042,7 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
     )
     if not use_api:
         await _set_order_status(order_id, "manual_pending")
+        track_event("generation_routed_to_manual", str(order.client_id), {"reason": "manual_mode_or_missing_api_key", "slides": total})
         await _send_manual_bundle(bot, state, order_id, brief, attachments, input_paths)
         return
 
@@ -1129,6 +1139,7 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
     missing = _pending_slots(list(brief.get("design_assets", [])), total)
     if fallback_reason or missing:
         await _set_order_status(order_id, "manual_pending")
+        track_event("generation_routed_to_manual", str(order.client_id), {"reason": "generation_incomplete_or_error", "slides": total})
         await _send_manual_bundle(
             bot, state, order_id, brief, attachments, input_paths,
             reason=fallback_reason or "Не все варианты слайдов были созданы автоматически.",
@@ -1136,6 +1147,7 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
         return
 
     await _set_order_status(order_id, "demo_review")
+    track_event("generation_completed", str(order.client_id), {"mode": "auto", "slides": total, "images": len(brief.get("design_assets", []))})
     await _send_owner_review(bot, order_id, brief)
 
 
@@ -1250,6 +1262,7 @@ async def process_design_action(call: CallbackQuery, state: FSMContext):
         return
 
     await _set_order_status(order_id, "demo_sent")
+    track_event("demo_sent", str(order.client_id), {"images": len(assets), "platform": str(brief.get("platform") or "unknown")})
     await call.message.edit_reply_markup(reply_markup=None)
     await call.answer("Демо отправлено клиенту.")
     await call.message.answer(f"Демо по заявке {order_id[:8]} отправлено. Клиент получил только версии с водяным знаком.")
@@ -1579,6 +1592,7 @@ async def main():
     finally:
         await dp.storage.close()
         await bot.session.close()
+        shutdown_telemetry()
         await engine.dispose()
 
 
