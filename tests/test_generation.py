@@ -1,9 +1,11 @@
 import base64
+import io
 import tempfile
 import unittest
 from pathlib import Path
 
 import httpx
+from PIL import Image
 
 from generation import (
     ImageGenerationError,
@@ -12,14 +14,23 @@ from generation import (
 )
 
 
+def make_png_bytes() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 96), (120, 140, 160)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+PNG_BYTES = make_png_bytes()
+
+
 class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.product = self.root / "product.jpg"
         self.reference = self.root / "reference.jpg"
-        self.product.write_bytes(b"product")
-        self.reference.write_bytes(b"reference")
+        Image.new("RGB", (80, 100), (20, 30, 40)).save(self.product, format="JPEG")
+        Image.new("RGB", (80, 100), (50, 60, 70)).save(self.reference, format="JPEG")
         self.outputs = [self.root / "out1.png", self.root / "out2.png"]
 
     def tearDown(self):
@@ -49,12 +60,15 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
 
         def handler(request):
             seen.append(request)
-            b64 = base64.b64encode(b"png-bytes").decode()
+            b64 = base64.b64encode(PNG_BYTES).decode()
             return httpx.Response(200, json={"data": [{"b64_json": b64}, {"b64_json": b64}]})
 
         result = await self.call(handler)
         self.assertEqual(len(result), 2)
-        self.assertEqual([p.read_bytes() for p in self.outputs], [b"png-bytes", b"png-bytes"])
+        for path in self.outputs:
+            with Image.open(path) as generated:
+                self.assertEqual(generated.format, "PNG")
+                self.assertEqual(generated.size, (64, 96))
         self.assertEqual(seen[0].headers["Idempotency-Key"], "order:abc:slide:1")
         self.assertEqual(str(seen[0].url), "https://api.example.test/v1/images/edits")
         body = seen[0].read().decode("latin1")
@@ -71,7 +85,7 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
             attempts.append(request.headers["Idempotency-Key"])
             if len(attempts) == 1:
                 return httpx.Response(502, headers={"Retry-After": "3"})
-            b64 = base64.b64encode(b"image").decode()
+            b64 = base64.b64encode(PNG_BYTES).decode()
             return httpx.Response(200, json={"data": [{"b64_json": b64}, {"b64_json": b64}]})
 
         async def record_sleep(value):
@@ -222,6 +236,30 @@ class ImageGenerationTests(unittest.IsolatedAsyncioTestCase):
             await self.call(handler)
         self.assertTrue(ctx.exception.request_succeeded)
         self.assertTrue(ctx.exception.uncertain)
+
+    async def test_corrupt_image_payload_is_rejected_after_successful_http_request(self):
+        def handler(request):
+            bad = base64.b64encode(b"not-an-image").decode()
+            return httpx.Response(200, json={"data": [{"b64_json": bad}, {"b64_json": bad}]})
+
+        with self.assertRaises(ImageGenerationError) as ctx:
+            await self.call(handler)
+        self.assertTrue(ctx.exception.request_succeeded)
+        self.assertTrue(ctx.exception.uncertain)
+        self.assertFalse(self.outputs[0].exists())
+        self.assertFalse(self.outputs[1].exists())
+
+    async def test_invalid_input_is_rejected_before_network_request(self):
+        self.product.write_bytes(b"not-an-image")
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(200, json={"data": []})
+
+        with self.assertRaises(ImageGenerationError):
+            await self.call(handler)
+        self.assertEqual(calls, [])
 
     async def test_prompt_preserves_product_identity(self):
         prompt = build_product_prompt({
