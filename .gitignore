@@ -1,4 +1,6 @@
 .env
+ci-smoke*
+*.db-journal
 .venv/
 __pycache__/
 *.py[cod]
