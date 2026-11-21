@@ -347,8 +347,8 @@ async def admin_pending_orders(message: Message):
         await message.answer("Новых заявок на проверке нет.", reply_markup=admin_menu())
         return
     await message.answer(
-        "Заявки, ожидающие проверки:\\n" +
-        "\\n".join(f"{row.id[:8]} · {row.status} · {row.source}" for row in rows) +
+        "Заявки, ожидающие проверки:\n" +
+        "\n".join(f"{row.id[:8]} · {row.status} · {row.source}" for row in rows) +
         "\\n\\nЧтобы открыть заявку, нажми «Открыть заявку» и отправь её ID.",
         reply_markup=admin_menu(),
     )
