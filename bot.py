@@ -269,7 +269,7 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
             return False
         client = await db.get(Client, order.client_id)
         attachments = list((await db.scalars(
-            select(OrderFile).where(OrderFile.order_id == order_id)
+            select(OrderFile).where(OrderFile.order_id == order_id).order_by(OrderFile.id)
         )).all())
         brief = dict(order.brief or {})
         client_id = client.telegram_id if client else 0
@@ -284,37 +284,64 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
         )).all())
 
     status_labels = {
-        "lead": "Лид", "brief": "Черновик", "admin_review": "Ожидает проверки",
-        "waiting_client_info": "Ожидает ответа клиента", "accepted": "Принята",
-        "generating": "Генерация", "manual_pending": "Ожидает ручные изображения",
+        "lead": "Лид", "brief": "Черновик", "admin_review": "На проверке",
+        "waiting_client_info": "Ждём клиента", "accepted": "Принята",
+        "generating": "Генерация", "manual_pending": "Ручная загрузка",
         "demo_review": "Демо на проверке", "sending_demo": "Отправка демо",
         "demo_sent": "Демо отправлено", "paid": "Оплачена",
         "completed": "Завершена", "rejected": "Отклонена", "cancelled": "Отменена",
     }
-    created_label = created_at.strftime("%d.%m.%Y %H:%M UTC") if created_at else "неизвестно"
-    client_label = first_name or "Имя не указано"
-    client_label += f" (@{username})" if username else ""
+    status_label = status_labels.get(status, status)
+    created_label = created_at.strftime("%d.%m.%Y %H:%M UTC") if created_at else "дата неизвестна"
+    who = first_name or "Имя не указано"
+    if username:
+        who += f" (@{username})"
+    product = str(brief.get("product") or notes or "Товар не указан")
+    product = " ".join(product.split())[:110]
+    platform = brief.get("platform") or "Площадка не указана"
+    slides = brief.get("slides")
+    slide_label = f"{slides} слайд(ов)" if slides else "количество слайдов не указано"
+
+    # First block matches the compact cards in the order list.
     lines = [
-        f"ЗАЯВКА №{order_id[:8]}",
-        f"Статус: {status_labels.get(status, status)}",
-        f"Клиент: {client_label}",
+        f"№{order_id[:8]} · {status_label}",
+        f"Клиент: {who}",
+        f"Товар: {product}",
+        f"Площадка: {platform} · {slide_label}",
+        f"Материалов: {len(attachments)} · {created_label}",
+        "",
+        "ПОДРОБНОСТИ ЗАЯВКИ",
+        f"Полный номер: {order_id}",
         f"Telegram ID: {client_id}",
-        f"Создана: {created_label}",
         f"Источник: {'анкета бота' if source == 'bot' else source}",
     ]
     for key, label in (
-        ("platform", "Площадка"), ("product", "Товар"), ("advantages", "Преимущества"),
-        ("required_text", "Тексты"), ("style", "Стиль"), ("colors", "Цвета"),
-        ("slides", "Слайдов"), ("deadline", "Срок"),
+        ("advantages", "Преимущества"),
+        ("required_text", "Обязательные тексты и характеристики"),
+        ("style", "Стиль"),
+        ("colors", "Цвета"),
+        ("deadline", "Срок"),
     ):
         value = brief.get(key)
         if value not in (None, ""):
+            if isinstance(value, (list, tuple)):
+                value = ", ".join(str(item) for item in value)
             lines.append(f"{label}: {value}")
-    if notes:
+    reference_texts = brief.get("reference_texts") or []
+    if reference_texts:
+        lines.append("Референсы: " + " | ".join(str(x) for x in reference_texts))
+    if notes and notes != product:
         lines.append(f"Дополнительная информация: {notes}")
-    lines.append(f"Вложений: {len(attachments)}")
     if payments:
-        lines.append("Оплаты: " + "; ".join(f"{p.amount} RUB" for p in payments))
+        total_paid = sum(int(p.amount or 0) for p in payments)
+        lines.append(f"Оплаты: {total_paid} RUB ({len(payments)} записей)")
+        for payment in payments:
+            paid_at = payment.created_at.strftime("%d.%m.%Y %H:%M UTC") if payment.created_at else "дата неизвестна"
+            suffix = f" · {payment.note}" if payment.note else ""
+            lines.append(f"  • {payment.amount} RUB · {paid_at}{suffix}")
+    else:
+        lines.append("Оплаты: не зарегистрированы")
+
     if status == "accepted":
         keyboard = generate_order_menu(order_id)
     elif status == "manual_pending":
@@ -325,17 +352,17 @@ async def send_order_card(bot: Bot, admin_chat_id: int, order_id: str):
         keyboard = order_action_menu(order_id)
     else:
         keyboard = None
-    await bot.send_message(admin_chat_id, "\n".join(lines), reply_markup=keyboard)
-    for item in attachments:
+    await bot.send_message(admin_chat_id, "\\n".join(lines), reply_markup=keyboard)
+    for index, item in enumerate(attachments, start=1):
         try:
+            caption = f"Материал {index}/{len(attachments)} · заявка {order_id[:8]}"
             if item.file_type == "photo":
-                await bot.send_photo(admin_chat_id, item.telegram_file_id)
+                await bot.send_photo(admin_chat_id, item.telegram_file_id, caption=caption)
             else:
-                await bot.send_document(admin_chat_id, item.telegram_file_id)
+                await bot.send_document(admin_chat_id, item.telegram_file_id, caption=caption)
         except Exception:
-            await bot.send_message(admin_chat_id, f"Не удалось повторно отправить вложение заявки {order_id[:8]}.")
+            await bot.send_message(admin_chat_id, f"Не удалось повторно отправить материал {index} заявки {order_id[:8]}.")
     return True
-
 
 async def get_client(db, user):
     client = await db.scalar(select(Client).where(Client.telegram_id == user.id))
