@@ -247,7 +247,22 @@ def admin_menu():
 
 
 def admin_only(user_id: int) -> bool:
+    # Single-owner deployment: no staff roles or shared admin access.
     return user_id == settings.admin_id
+
+
+async def require_admin_message(message: Message) -> bool:
+    if message.from_user is None or not admin_only(message.from_user.id):
+        await message.answer("Эта команда доступна только владельцу бота.")
+        return False
+    return True
+
+
+async def require_admin_callback(call: CallbackQuery) -> bool:
+    if call.from_user is None or not admin_only(call.from_user.id):
+        await call.answer("Эта функция доступна только владельцу бота.", show_alert=True)
+        return False
+    return True
 
 
 def platform_menu():
@@ -415,28 +430,32 @@ async def start(message: Message, state: FSMContext):
 
 @router.message(F.text == "📥 Все заявки")
 async def admin_all_orders(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     await orders(message)
 
 
 @router.message(F.text == "🕒 На проверке")
 async def admin_pending_orders(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     await send_orders_list(message, statuses=["admin_review"], limit=30)
 
 
 @router.message(F.text == "⚙️ Состояние бота")
 async def admin_health_button(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     await health(message)
 
 
 @router.message(F.text.in_({"🆔 Найти по ID", "🔎 Открыть заявку"}))
 async def admin_review_button(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     await state.clear()
     await state.set_state(AdminAction.lookup_order)
@@ -449,7 +468,8 @@ async def admin_review_button(message: Message, state: FSMContext):
     "⚙️ Состояние бота", "👤 Режим клиента", "🆔 Найти по ID", "🔎 Открыть заявку",
 }))
 async def admin_lookup_navigation(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     value = (message.text or "").strip()
     await state.clear()
@@ -484,7 +504,8 @@ async def admin_lookup_navigation(message: Message, state: FSMContext):
 
 @router.message(AdminAction.lookup_order, F.text)
 async def admin_lookup_order(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     value = (message.text or "").strip()
     if value.casefold() in {"отмена", "/cancel"}:
@@ -500,21 +521,24 @@ async def admin_lookup_order(message: Message, state: FSMContext):
 
 @router.message(F.text == "👤 Режим клиента")
 async def admin_client_mode(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     await message.answer("Клиентское меню включено. Для возврата к панели администратора напиши /start.", reply_markup=menu())
 
 
 @router.message(F.text.in_({"💰 Оплаты", "💳 Оплаты"}))
 async def admin_payments_button(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     await admin_payment_menu(message)
 
 
 @router.message(F.text == "📨 Напоминания")
 async def admin_reminders_button(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     active_statuses = [
         "admin_review", "waiting_client_info", "accepted", "manual_pending",
@@ -559,23 +583,28 @@ async def admin_reminders_button(message: Message):
 
 @router.message(F.text == "🎨 На генерации")
 async def admin_generating_orders(message: Message):
-    if not admin_only(message.from_user.id): return
+    if not await require_admin_message(message):
+        return
     await admin_list_status(message, ["accepted", "manual_pending", "generating"])
 
 
 @router.message(F.text == "👁 На согласовании")
 async def admin_reviewing_orders(message: Message):
-    if not admin_only(message.from_user.id): return
+    if not await require_admin_message(message):
+        return
     await admin_list_status(message, ["demo_review", "demo_sent"])
 
 
 async def admin_list_status(message: Message, statuses: list[str]):
+    if not await require_admin_message(message):
+        return
     await send_orders_list(message, statuses=statuses, limit=30)
 
 
 @router.message(F.text == "💰 Оплаты")
 async def admin_payment_menu(message: Message):
-    if not admin_only(message.from_user.id): return
+    if not await require_admin_message(message):
+        return
     async with Session() as db:
         payments = list((await db.scalars(
             select(Payment).order_by(Payment.created_at.desc()).limit(20)
@@ -618,7 +647,8 @@ async def admin_payment_menu(message: Message):
 
 @router.message(F.text == "👥 Клиенты")
 async def admin_clients(message: Message):
-    if not admin_only(message.from_user.id): return
+    if not await require_admin_message(message):
+        return
     async with Session() as db:
         clients = list((await db.scalars(select(Client).order_by(Client.created_at.desc()).limit(30))).all())
         total = await db.scalar(select(func.count(Client.id)))
@@ -632,7 +662,8 @@ async def admin_clients(message: Message):
 
 @router.message(F.text == "⚙️ Настройки")
 async def admin_settings(message: Message):
-    if not admin_only(message.from_user.id): return
+    if not await require_admin_message(message):
+        return
     await message.answer(
         f"Режим генерации: {settings.image_mode}\nМодель: {settings.openai_image_model}\n"
         f"Лимит слайдов: {settings.max_generation_slides}\nЛимит резерва на заявку: USD {settings.max_order_cost_usd:.2f}\n"
@@ -643,7 +674,8 @@ async def admin_settings(message: Message):
 
 @router.message(F.text == "📊 Статистика")
 async def admin_stats(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
 
     week_ago = now() - timedelta(days=7)
@@ -704,7 +736,8 @@ async def admin_stats(message: Message):
 
 @router.message(F.text == "📣 Рассылка")
 async def admin_broadcast_start(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id): return
+    if not await require_admin_message(message):
+        return
     await state.clear()
     await state.set_state(AdminAction.broadcast)
     await message.answer("Пришли текст рассылки. Для отмены напиши «Отмена». Сообщение отправится активным клиентам из базы.")
@@ -712,7 +745,8 @@ async def admin_broadcast_start(message: Message, state: FSMContext):
 
 @router.message(AdminAction.broadcast, F.text)
 async def admin_broadcast_send(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id): return
+    if not await require_admin_message(message):
+        return
     body = (message.text or "").strip()
     if body.casefold() == "отмена":
         await state.clear()
@@ -733,7 +767,8 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
 
 @router.message(Command("price"))
 async def admin_price_command(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id): return
+    if not await require_admin_message(message):
+        return
     await state.clear()
     await state.set_state(AdminAction.set_price)
     await message.answer("Отправь новый прайс в формате: Название — сумма, по одной позиции на строку. Для отмены: Отмена.")
@@ -741,7 +776,8 @@ async def admin_price_command(message: Message, state: FSMContext):
 
 @router.message(AdminAction.set_price, F.text)
 async def admin_price_save(message: Message, state: FSMContext):
-    if not admin_only(message.from_user.id): return
+    if not await require_admin_message(message):
+        return
     if (message.text or "").strip().casefold() == "отмена":
         await state.clear()
         await message.answer("Изменение прайса отменено.", reply_markup=admin_menu())
@@ -934,7 +970,8 @@ async def confirm_brief(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("order:"))
 async def process_order_action(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != settings.admin_id:
+    if not await require_admin_callback(call):
+        return
         await call.answer("Это действие доступно только администратору.", show_alert=True)
         return
 
@@ -1009,7 +1046,8 @@ async def process_order_action(call: CallbackQuery, state: FSMContext):
 
 @router.message(AdminAction.clarification)
 async def send_clarification_to_client(message: Message, state: FSMContext):
-    if message.from_user.id != settings.admin_id:
+    if not await require_admin_message(message):
+        return
         return
     text = (message.text or "").strip()
     if not text:
@@ -1194,7 +1232,8 @@ async def send_orders_list(message: Message, statuses: list[str] | None = None, 
 
 @router.callback_query(F.data.startswith("admin:open:"))
 async def admin_open_order(call: CallbackQuery):
-    if not admin_only(call.from_user.id):
+    if not await require_admin_callback(call):
+        return
         await call.answer("Доступ только администратору.", show_alert=True)
         return
     order_id = call.data.split(":", 2)[2]
@@ -1222,12 +1261,21 @@ def _hermes_bridge_unauthorized() -> web.Response:
 async def hermes_bridge_health(request: web.Request) -> web.Response:
     if not _hermes_bridge_authorized(request):
         return _hermes_bridge_unauthorized()
-    return web.json_response({"ok": True, "service": "pervyi-slide-hermes-bridge"})
+    return web.json_response({"ok": True, "service": "pervyi-slide-hermes-bridge", "access": "owner-only"})
+
+
+async def _owner_only_bridge_response(request: web.Request) -> web.Response | None:
+    # The worker token is a machine credential. It is deliberately separate from
+    # Telegram access: only the configured phone worker may poll or return jobs.
+    if not _hermes_bridge_authorized(request):
+        return _hermes_bridge_unauthorized()
+    return None
 
 
 async def hermes_bridge_next(request: web.Request) -> web.Response:
-    if not _hermes_bridge_authorized(request):
-        return _hermes_bridge_unauthorized()
+    denied = await _owner_only_bridge_response(request)
+    if denied is not None:
+        return denied
     async with Session() as db:
         statement = (
             select(HermesJob)
@@ -1246,13 +1294,16 @@ async def hermes_bridge_next(request: web.Request) -> web.Response:
 
 
 async def hermes_bridge_result(request: web.Request) -> web.Response:
-    if not _hermes_bridge_authorized(request):
-        return _hermes_bridge_unauthorized()
+    denied = await _owner_only_bridge_response(request)
+    if denied is not None:
+        return denied
     try:
         payload = await request.json()
     except (ValueError, web.HTTPException):
         return web.json_response({"error": "invalid_json"}, status=400)
 
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "invalid_payload"}, status=400)
     job_id = str(payload.get("job_id") or "").strip()
     outcome = str(payload.get("status") or "").strip().lower()
     result_text = str(payload.get("result") or "")[:24000]
@@ -1289,7 +1340,8 @@ async def hermes_bridge_result(request: web.Request) -> web.Response:
 
 @router.message(Command("agent"))
 async def admin_hermes_agent(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     if not settings.hermes_bridge_token:
         await message.answer("Связь с Hermes на телефоне ещё не настроена.")
@@ -1314,7 +1366,8 @@ async def admin_hermes_agent(message: Message):
 
 @router.message(Command("agent_status"))
 async def admin_hermes_status(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     async with Session() as db:
         jobs = list((await db.scalars(
@@ -1333,14 +1386,16 @@ async def admin_hermes_status(message: Message):
 
 @router.message(Command("orders"))
 async def orders(message: Message):
-    if message.from_user.id != settings.admin_id:
+    if not await require_admin_message(message):
+        return
         return
     await send_orders_list(message)
 
 
 @router.message(Command("review"))
 async def review_order(message: Message, command_text: str | None = None):
-    if message.from_user.id != settings.admin_id:
+    if not await require_admin_message(message):
+        return
         return
     parts = (command_text or message.text or "").split(maxsplit=1)
     prefix = parts[1].strip() if len(parts) > 1 else ""
@@ -1799,7 +1854,8 @@ async def _begin_generation(bot: Bot, state: FSMContext, order_id: str, *, force
 
 @router.message(Command("generate"))
 async def generate_order_design(message: Message, state: FSMContext):
-    if message.from_user.id != settings.admin_id:
+    if not await require_admin_message(message):
+        return
         return
     parts = (message.text or "").split(maxsplit=1)
     prefix = parts[1].strip() if len(parts) > 1 else ""
@@ -1827,7 +1883,8 @@ async def generate_order_design(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("design:"))
 async def process_design_action(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != settings.admin_id:
+    if not await require_admin_callback(call):
+        return
         await call.answer("Только администратор может запускать генерацию и одобрять отправку.", show_alert=True)
         return
     try:
@@ -2048,7 +2105,8 @@ async def manual_upload_help(message: Message, state: FSMContext):
 
 @router.message(Command("order"))
 async def create_assistant_order(message: Message):
-    if message.from_user.id != settings.admin_id:
+    if not await require_admin_message(message):
+        return
         return
     anchor_message = message.reply_to_message
     if anchor_message is None:
@@ -2236,7 +2294,8 @@ async def deliver_paid_originals(bot: Bot, order_id: str) -> tuple[bool, str]:
 
 @router.message(Command("quote"))
 async def quote_order(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
@@ -2300,7 +2359,8 @@ async def quote_order(message: Message):
 
 @router.message(Command("paid"))
 async def paid(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
@@ -2359,7 +2419,8 @@ async def paid(message: Message):
 
 @router.message(Command("deliver"))
 async def deliver_order_originals(message: Message):
-    if not admin_only(message.from_user.id):
+    if not await require_admin_message(message):
+        return
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
@@ -2380,7 +2441,8 @@ async def deliver_order_originals(message: Message):
 
 @router.message(Command("remind"))
 async def remind(message: Message):
-    if not admin_only(message.from_user.id): return
+    if not await require_admin_message(message):
+        return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer("Формат: /remind ID_ЗАЯВКИ")
